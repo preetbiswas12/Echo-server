@@ -1,0 +1,40 @@
+[package]
+edition.workspace = true
+homepage.workspace = true
+name = "conduit-config"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.11.0-alpha"
+
+[dependencies]
+# Self explanitory, used for deserializing the configuration
+serde.workspace = true
+# Parsing media retention policies
+bytesize = { workspace = true, features = ["serde"] }
+humantime-serde = "1"
+# Validating urls
+url = { version = "2", features = ["serde"] }
+# Error type
+thiserror.workspace = true
+# Validating S3 config
+rusty-s3.workspace = true
+# Proxy config
+reqwest.workspace = true
+# Generating documentation
+conduit-macros.workspace = true
+
+# default room version, server name, ignored keys
+[dependencies.ruma]
+features = ["client-api", "federation-api"]
+workspace = true
+
+[features]
+rocksdb = []
+sqlite = []
+
+# Used to generate docs, shouldn't be used outside of xtask
+doc-generators = ["conduit-macros/doc-generators"]
+turso = []
+
+[lints]
+workspace = true
