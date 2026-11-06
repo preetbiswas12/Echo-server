@@ -1,0 +1,101 @@
+# Build / CMake
+cmake-build-*/
+
+# Rust
+/target/
+**/*.rs.bk
+cached_target
+
+# IntelliJ / JetBrains
+.idea/
+out/
+*.iml
+modules.xml
+*.ipr
+.idea_modules/
+
+# VS Code (keep shared project settings)
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Environment / secrets (keep examples/templates)
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.p12
+
+# Conduit local config & data
+conduit.toml
+conduit.toml.local
+conduit.db
+conduit.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+/var/
+/data/
+/media/
+server_signing.key
+signing.key
+
+# Logs & runtime artifacts
+*.log
+logs/
+*.pid
+
+# Nix
+/result*
+
+# Direnv
+/.direnv
+
+# GitLab CI cache
+/.gitlab-ci.d
+
+# mdBook output
+/book/
+/public/
+
+# Docker / local overrides
+docker-compose.override.yml
+*.local.yml
+
+# Coverage / profiling / misc
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+flamegraph.svg
+perf.data*
