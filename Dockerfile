@@ -19,8 +19,12 @@ COPY conduit-macros/src conduit-macros/src
 COPY xtask/src xtask/src
 COPY .cargo .cargo
 
-# Build the Conduit binary (Turso enabled for persistent remote DB; RocksDB/SQLite also available).
-RUN cargo build --release -p conduit --features "backend_turso,backend_sqlite,backend_rocksdb,conduit_bin"
+# Build the Conduit binary. Default omits RocksDB to reduce build memory/time (important for CI/Render builds).
+# Override with: --build-arg CARGO_FEATURES="backend_turso,backend_sqlite,backend_rocksdb,conduit_bin"
+ARG CARGO_FEATURES="backend_turso,backend_sqlite,conduit_bin"
+ARG CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+RUN cargo build --release -p conduit --no-default-features --features "${CARGO_FEATURES}"
 
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
