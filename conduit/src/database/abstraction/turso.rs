@@ -2,7 +2,7 @@ use super::{KeyValueDatabaseEngine, KvTree};
 use crate::{Result, utils::error::Error};
 use conduit_config::Config;
 use libsql::Builder;
-use std::{pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 use tracing::debug;
 
 type TupleOfBytes = (Vec<u8>, Vec<u8>);
@@ -20,22 +20,19 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
             )
         })?;
 
-        // Validate connectivity at startup
-        let token = turso.auth_token.as_deref().unwrap_or("");
-        let db = Builder::new_remote(turso.url.clone(), token.to_string());
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|_| Error::Initialization("failed to create tokio runtime"))?;
-        rt.block_on(db.build())
-            .map_err(|e| Error::LibSql(e.to_string()))?;
-        drop(rt);
-
-        Ok(Arc::new(Engine {
+        let engine = Engine {
             url: turso.url.clone(),
             auth_token: turso.auth_token.clone(),
-        }))
+        };
+
+        // Validate connectivity and ensure auxiliary tables exist (e.g. media chunk storage).
+        engine.ensure_aux_tables()?;
+
+        Ok(Arc::new(engine))
     }
 
     fn open_tree(&self, name: &'static str) -> Result<Arc<dyn KvTree>> {
+        ensure_kv_table(&self.url, &self.auth_token, name)?;
         Ok(Arc::new(TursoTable {
             url: self.url.clone(),
             auth_token: self.auth_token.clone(),
@@ -69,6 +66,64 @@ where
 
 fn token_str(auth_token: &Option<String>) -> String {
     auth_token.as_deref().unwrap_or("").to_string()
+}
+
+fn is_safe_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn ensure_kv_table(url: &str, auth_token: &Option<String>, name: &str) -> Result<()> {
+    if !is_safe_identifier(name) {
+        return Err(Error::Initialization("invalid Turso table name"));
+    }
+    let url = url.to_owned();
+    let token = token_str(auth_token);
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS \"{name}\" (\"key\" BLOB PRIMARY KEY, \"value\" BLOB NOT NULL)"
+    );
+    block_on(async move {
+        let db = Builder::new_remote(url, token)
+            .build()
+            .await
+            .map_err(|e| Error::LibSql(e.to_string()))?;
+        let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+        conn.execute(&sql, libsql::params![])
+            .await
+            .map_err(|e| Error::LibSql(e.to_string()))?;
+        Ok(())
+    })
+}
+
+impl Engine {
+    fn ensure_aux_tables(&self) -> Result<()> {
+        let url = self.url.clone();
+        let token = token_str(&self.auth_token);
+        block_on(async move {
+            let db = Builder::new_remote(url, token)
+                .build()
+                .await
+                .map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS media_chunks (file_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, chunk_data BLOB NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (file_id, chunk_index))",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| Error::LibSql(e.to_string()))?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_chunks_created_at ON media_chunks(created_at)",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| Error::LibSql(e.to_string()))?;
+            Ok(())
+        })
+    }
 }
 
 pub struct TursoTable {

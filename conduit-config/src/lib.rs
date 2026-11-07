@@ -37,7 +37,9 @@ pub struct IncompleteConfig {
     pub tls: Option<TlsConfig>,
 
     pub server_name: OwnedServerName,
+    #[serde(default = "default_database_backend")]
     pub database_backend: DatabaseBackend,
+    #[serde(default = "default_database_path")]
     pub database_path: String,
     #[serde(default = "default_db_cache_capacity_mb")]
     pub db_cache_capacity_mb: f64,
@@ -933,6 +935,25 @@ fn default_trusted_servers() -> Vec<TrustedServer> {
 
 fn default_log() -> String {
     "warn,state_res=warn,_=off".to_owned()
+}
+
+fn default_database_backend() -> DatabaseBackend {
+    #[cfg(feature = "turso")]
+    {
+        DatabaseBackend::Turso
+    }
+    #[cfg(all(not(feature = "turso"), feature = "rocksdb"))]
+    {
+        DatabaseBackend::RocksDB
+    }
+    #[cfg(all(not(feature = "turso"), not(feature = "rocksdb"), feature = "sqlite"))]
+    {
+        DatabaseBackend::SQLite
+    }
+}
+
+fn default_database_path() -> String {
+    "/var/lib/matrix-conduit".to_owned()
 }
 
 fn default_turn_ttl() -> u64 {

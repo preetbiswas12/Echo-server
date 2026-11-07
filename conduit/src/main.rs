@@ -45,7 +45,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-static SUB_TABLES: [&str; 3] = ["well_known", "tls", "media"]; // Not doing `proxy` cause setting that with env vars would be a pain
+static SUB_TABLES: [&str; 4] = ["well_known", "tls", "media", "turso"]; // Not doing `proxy` cause setting that with env vars would be a pain
 
 // Yeah, I know it's terrible, but since it seems the container users dont want syntax like A[B][C]="...",
 // this is what we have to deal with. Also see: https://github.com/SergioBenitez/Figment/issues/12#issuecomment-801449465
@@ -65,15 +65,11 @@ async fn main() {
     clap::parse();
 
     // Initialize config
-    let raw_config = Figment::new()
-        .merge(
-            Toml::file(
-                Env::var("CONDUIT_CONFIG").expect(
-                    "The CONDUIT_CONFIG env var needs to be set. Example: /etc/conduit.toml",
-                ),
-            )
-            .nested(),
-        )
+    let mut raw_config = Figment::new();
+    if let Some(config_path) = Env::var("CONDUIT_CONFIG").filter(|p| !p.trim().is_empty()) {
+        raw_config = raw_config.merge(Toml::file(config_path).nested());
+    }
+    let raw_config = raw_config
         .merge(Env::prefixed("CONDUIT_").global().map(|k| {
             let mut key: Uncased = k.into();
 
