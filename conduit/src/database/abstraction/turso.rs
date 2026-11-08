@@ -49,19 +49,24 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
     }
 }
 
-/// Run an async libsql operation on a temporary Tokio runtime.
+/// Run an async libsql operation from synchronous Conduit DB traits.
 ///
-/// Conduit's database traits are synchronous, but libsql is async (HTTP-based).
-/// We bridge the gap by creating a short-lived runtime per operation.
+/// When called inside an existing Tokio runtime (normal startup/request path),
+/// use `block_in_place` + the current handle to avoid "runtime within runtime"
+/// panics. Otherwise (e.g. isolated contexts), create a temporary runtime.
 fn block_on<F, T>(f: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|_| Error::Initialization("failed to create tokio runtime"))?;
-    let result = rt.block_on(f);
-    drop(rt);
-    result
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(f))
+    } else {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|_| Error::Initialization("failed to create tokio runtime"))?;
+        let result = rt.block_on(f);
+        drop(rt);
+        result
+    }
 }
 
 fn token_str(auth_token: &Option<String>) -> String {
