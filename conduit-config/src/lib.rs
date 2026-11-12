@@ -946,9 +946,21 @@ fn default_database_backend() -> DatabaseBackend {
     {
         DatabaseBackend::RocksDB
     }
-    #[cfg(all(not(feature = "turso"), not(feature = "rocksdb"), feature = "sqlite"))]
+    #[cfg(all(
+        not(feature = "turso"),
+        not(feature = "rocksdb"),
+        feature = "sqlite"
+    ))]
     {
         DatabaseBackend::SQLite
+    }
+    #[cfg(all(
+        not(feature = "turso"),
+        not(feature = "rocksdb"),
+        not(feature = "sqlite")
+    ))]
+    {
+        DatabaseBackend::RocksDB
     }
 }
 

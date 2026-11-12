@@ -3,20 +3,17 @@
 # Env vars (CONDUIT_*) still override anything set here.
 
 [global.rate_limiting]
-# Start from the private_small preset and relax the limits that bite on
-# phone clients + push notifications (ntfy.sh pushes events via /send).
-inherits = "private_small"
+# private_medium preset: auth-failure limiter 10/hour (burst 20) instead of
+# private_small's 1/hour, which caused lockouts on phone clients.
+inherits = "private_medium"
 
 # Global (per-IP) client limits — bumped for login lockout and message/push throughput.
 [global.rate_limiting.client.global]
 login = { per_hour = 100, burst_capacity = 50 }
 send_event = { per_second = 10, burst_capacity = 100 }
 
-# Per-target limits — authentication_failures guards brute-force token guessing;
-# relaxed so an idle logged-out device doesn't lock out an IP for an hour.
-[global.rate_limiting.client.target]
-authentication_failures = { per_hour = 60, burst_capacity = 30 }
-
 # Federation limits intentionally left at preset defaults (federation is disabled
 # anyway); this empty table is required by the config schema.
+# NOTE: `authentication_failures` cannot be overridden via TOML in this fork
+# (schema limitation), so we rely on the private_medium preset for it.
 [global.rate_limiting.federation]
