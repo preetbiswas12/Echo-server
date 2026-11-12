@@ -36,12 +36,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/conduit /usr/local/bin/conduit
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/conduit-rate-limits.toml /app/conduit.toml
 RUN chmod +x /usr/local/bin/entrypoint.sh \
   && mkdir -p /var/lib/matrix-conduit \
   && chown -R conduit:conduit /var/lib/matrix-conduit
 
 # Render injects PORT. Set CONDUIT_SERVER_NAME, DB/Turso settings, and secrets via env vars.
+# CONDUIT_CONFIG points at the baked rate-limit overrides; env vars still override the file.
 ENV CONDUIT_ADDRESS=0.0.0.0 \
+    CONDUIT_CONFIG=/app/conduit.toml \
     CONDUIT_DATABASE_PATH=/var/lib/matrix-conduit
 
 EXPOSE 6167
