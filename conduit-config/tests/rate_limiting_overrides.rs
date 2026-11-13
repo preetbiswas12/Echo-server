@@ -16,7 +16,10 @@ use conduit_config::rate_limiting::{
     ClientRestriction, Config as RateLimitingConfig, FederationRestriction, MediaLimitation,
     MediaTimeframe, RequestLimitation, Timeframe,
 };
+use conduit_config::{IncompleteScopedMediaRetentionConfig, MediaRetentionScope};
 use figment::{providers::{Format, Toml}, Figment};
+use serde::Deserialize;
+use std::{collections::HashSet, time::Duration};
 
 const BAKED_CONFIG: &str = include_str!("../../docker/conduit-rate-limits.toml");
 
@@ -165,4 +168,55 @@ fn federation_keeps_preset_defaults() {
         "public_large federation Join is 1 per second, got {join:?}",
     );
     assert_eq!(join.burst_capacity.get(), 50);
+}
+
+#[derive(Default, Deserialize)]
+struct ProbeMedia {
+    #[serde(default)]
+    retention: Option<HashSet<IncompleteScopedMediaRetentionConfig>>,
+}
+
+#[derive(Deserialize)]
+struct ProbeGlobal {
+    #[serde(default, with = "humantime_serde::option")]
+    message_retention: Option<Duration>,
+    #[serde(default)]
+    media: ProbeMedia,
+}
+
+#[test]
+fn retention_policies_parse() {
+    const SIXTY_DAYS: Duration = Duration::from_secs(60 * 60 * 24 * 60);
+
+    let probe: ProbeGlobal = Figment::new()
+        .merge(Toml::string(BAKED_CONFIG).nested())
+        .extract()
+        .expect("retention config must parse");
+
+    assert_eq!(probe.message_retention, Some(SIXTY_DAYS));
+
+    let retention = probe.media.retention.expect("media retention must be set");
+    assert_eq!(retention.len(), 3, "unexpected media retention entries");
+
+    let local = retention
+        .iter()
+        .find(|entry| entry.scope.is_none())
+        .expect("scope-less media retention entry");
+    assert_eq!(local.accessed, Some(SIXTY_DAYS));
+    assert_eq!(
+        local.space.as_ref().map(bytesize::ByteSize::as_u64),
+        Some(3_000_000_000),
+        "3 GB global media space cap",
+    );
+
+    for (scope, expected) in [
+        (MediaRetentionScope::Remote, "remote"),
+        (MediaRetentionScope::Thumbnail, "thumbnail"),
+    ] {
+        let entry = retention
+            .iter()
+            .find(|entry| entry.scope.as_ref() == Some(&scope))
+            .unwrap_or_else(|| panic!("{expected} media retention entry must be set"));
+        assert_eq!(entry.accessed, Some(SIXTY_DAYS));
+    }
 }

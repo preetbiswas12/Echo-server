@@ -1197,6 +1197,7 @@ impl KeyValueDatabase {
         services().sending.start_handler();
 
         services().media.start_time_retention_checker();
+        services().rooms.timeline.start_message_retention_checker();
         services().users.start_device_last_seen_update_task();
 
         Self::start_cleanup_task().await;

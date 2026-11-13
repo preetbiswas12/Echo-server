@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::Deref as _,
     sync::Arc,
+    time::Duration,
 };
 
 pub use data::Data;
@@ -30,7 +31,10 @@ use ruma::{
 };
 use serde::Deserialize;
 use serde_json::value::{RawValue as RawJsonValue, to_raw_value};
-use tokio::sync::{Mutex, MutexGuard, RwLock};
+use tokio::{
+    sync::{Mutex, MutexGuard, RwLock},
+    time::interval,
+};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -1272,6 +1276,105 @@ impl Service {
             )?;
         }
         // If event does not exist, just noop
+        Ok(())
+    }
+
+    /// Starts a background task which redacts non-state timeline events older
+    /// than the configured message retention period, erasing their content
+    /// from the database.
+    pub fn start_message_retention_checker(&self) {
+        let Some(retention) = services().globals.config.message_retention else {
+            return;
+        };
+
+        // Mirror the media retention checker's schedule: check at most once a
+        // day, and more frequently for shorter retention periods.
+        let cleanup_interval = interval(
+            retention
+                .mul_f32(0.1)
+                .max(Duration::from_secs(60))
+                .min(Duration::from_secs(60 * 60 * 24)),
+        );
+
+        tokio::spawn(async move {
+            let mut i = cleanup_interval;
+            // Consume the immediate first tick so the first purge happens
+            // after one full interval, once the server has warmed up.
+            i.tick().await;
+            loop {
+                i.tick().await;
+                if let Err(e) =
+                    services().rooms.timeline.redact_events_past_retention(retention)
+                {
+                    error!("Failed to redact events past message retention: {e}");
+                }
+            }
+        });
+    }
+
+    /// Redacts all non-state timeline events older than `retention` in every
+    /// room. State events (membership, power levels, ...) are kept to preserve
+    /// room integrity, and redacted events keep their event ID, the same as a
+    /// user-initiated redaction; only their content is erased.
+    fn redact_events_past_retention(&self, retention: Duration) -> Result<()> {
+        let cutoff_ms = utils::secs_since_unix_epoch()
+            .saturating_sub(retention.as_secs())
+            .saturating_mul(1000);
+
+        let mut redacted = 0;
+
+        for room_id in services().rooms.metadata.iter_ids() {
+            let Ok(room_id) = room_id else {
+                continue;
+            };
+
+            let Some(shortroomid) = services().rooms.short.get_shortroomid(&room_id)? else {
+                continue;
+            };
+
+            for result in self.all_pdus(user_id!("@doesntmatter:conduit.rs"), &room_id)? {
+                let (_, pdu) = result?;
+
+                if u64::from(pdu.origin_server_ts) >= cutoff_ms
+                    || pdu.state_key.is_some()
+                    || pdu.kind == TimelineEventType::RoomRedaction
+                    || pdu.is_redacted()
+                {
+                    continue;
+                }
+
+                // A synthetic redaction event; it is only serialized into the
+                // redacted event's `unsigned.redacted_because`, never stored.
+                let reason: PduEvent = serde_json::from_value(serde_json::json!({
+                    "event_id": format!(
+                        "${}:{}",
+                        utils::random_string(24),
+                        services().globals.server_name(),
+                    ),
+                    "room_id": room_id,
+                    "sender": pdu.sender,
+                    "origin_server_ts": pdu.origin_server_ts,
+                    "type": "m.room.redaction",
+                    "content": {},
+                    "redacts": pdu.event_id,
+                    "prev_events": [],
+                    "auth_events": [],
+                    "depth": 0,
+                    "hashes": { "sha256": "" },
+                }))
+                .map_err(|_| {
+                    Error::bad_database("Failed to build retention redaction event.")
+                })?;
+
+                self.redact_pdu(&pdu.event_id, &reason, shortroomid)?;
+                redacted += 1;
+            }
+        }
+
+        if redacted > 0 {
+            info!("Redacted {redacted} events older than the message retention period");
+        }
+
         Ok(())
     }
 

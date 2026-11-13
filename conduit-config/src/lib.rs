@@ -61,6 +61,10 @@ pub struct IncompleteConfig {
     pub max_concurrent_requests: u16,
     #[serde(default = "default_max_fetch_prev_events")]
     pub max_fetch_prev_events: u16,
+    /// Delete (redact) non-state timeline events older than this duration
+    /// (e.g. "60days") from all rooms.
+    #[serde(default, with = "humantime_serde::option")]
+    pub message_retention: Option<Duration>,
     #[serde(default = "false_fn")]
     pub allow_registration: bool,
     #[serde(default, deserialize_with = "forbid_empty_registration_token")]
@@ -142,6 +146,7 @@ pub struct Config {
     pub max_request_size: u32,
     pub max_concurrent_requests: u16,
     pub max_fetch_prev_events: u16,
+    pub message_retention: Option<Duration>,
     pub allow_registration: bool,
     pub registration_token: Option<String>,
     pub openid_token_ttl: u64,
@@ -197,6 +202,7 @@ impl TryFrom<IncompleteConfig> for Config {
             max_request_size,
             max_concurrent_requests,
             max_fetch_prev_events,
+            message_retention,
             allow_registration,
             registration_token,
             openid_token_ttl,
@@ -319,6 +325,7 @@ impl TryFrom<IncompleteConfig> for Config {
             max_request_size,
             max_concurrent_requests,
             max_fetch_prev_events,
+            message_retention,
             allow_registration,
             registration_token,
             openid_token_ttl,

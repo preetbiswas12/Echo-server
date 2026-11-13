@@ -2,6 +2,28 @@
 # Loaded via CONDUIT_CONFIG=/app/conduit.toml in the Docker image.
 # Env vars (CONDUIT_*) still override anything set here.
 
+# ── Retention ────────────────────────────────────────────────────────────────
+# Messages (timeline events) older than this are redacted automatically once a
+# day: their content is erased from the database while room state (membership,
+# power levels, ...) is preserved. Set to 0 or unset to keep everything.
+[global]
+message_retention = "60days"
+
+# Media not accessed for 60 days is deleted. Total media is additionally
+# capped at 3 GB (oldest-accessed purged first on upload) so the server stays
+# inside Turso's free 5 GB storage quota with headroom for the chat database.
+[[global.media.retention]]
+accessed = "60days"
+space = "3 GB"
+
+[[global.media.retention]]
+scope = "remote"
+accessed = "60days"
+
+[[global.media.retention]]
+scope = "thumbnail"
+accessed = "60days"
+
 # ── Rate limiting ────────────────────────────────────────────────────────────
 # Conduit's limiter has no "disable" switch: every value must be non-zero.
 # Instead, each limit is set so high it can never be reached in practice:
