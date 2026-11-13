@@ -79,6 +79,13 @@ image = { version = "0.25", default-features = false, features = [
 # Used for creating media filenames
 hex = "0.4"
 sha2 = "0.10"
+# Used for encrypting media chunks in the Turso chunked media backend
+aes-gcm = { version = "0.10", default-features = false, features = [
+  "aes",
+  "alloc",
+], optional = true }
+# Used for deriving per-file media encryption keys from the master key
+hkdf = { version = "0.12", optional = true }
 
 # Used for parsing admin commands and purging media files for space limitations
 bytesize.workspace = true
@@ -177,7 +184,7 @@ nix = { version = "0.30", features = ["resource"] }
 [features]
 backend_rocksdb = ["conduit-config/rocksdb", "rocksdb"]
 backend_sqlite = ["conduit-config/sqlite", "sqlite"]
-backend_turso = ["conduit-config/turso", "libsql"]
+backend_turso = ["conduit-config/turso", "libsql", "aes-gcm", "hkdf"]
 conduit_bin = ["axum"]
 default = ["backend_turso", "backend_sqlite", "backend_rocksdb", "conduit_bin", "systemd"]
 jemalloc = ["tikv-jemallocator"]

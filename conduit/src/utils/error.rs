@@ -32,6 +32,8 @@ pub enum Error {
     #[cfg(feature = "backend_turso")]
     #[error("There was a problem with the connection to the Turso database: {0}")]
     LibSql(String),
+    #[error("Turso media backend: {0}")]
+    TursoMedia(String),
     #[error("Could not generate an image.")]
     ImageError {
         #[from]

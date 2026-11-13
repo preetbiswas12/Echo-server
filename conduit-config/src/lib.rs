@@ -285,6 +285,14 @@ impl TryFrom<IncompleteConfig> for Config {
                     directory_structure,
                 },
                 IncompleteMediaBackendConfig::S3(value) => MediaBackendConfig::S3(value),
+                #[cfg(feature = "turso")]
+                IncompleteMediaBackendConfig::Turso(turso_media) => {
+                    // Media chunks are stored in the main Turso database, so
+                    // its connection settings must be configured as well.
+                    turso_media.validate(turso.as_ref())?;
+
+                    MediaBackendConfig::Turso(turso_media)
+                }
             },
             retention: media.retention.into(),
         };
@@ -582,6 +590,8 @@ pub enum IncompleteMediaBackendConfig {
         directory_structure: DirectoryStructure,
     },
     S3(S3MediaBackend),
+    #[cfg(feature = "turso")]
+    Turso(TursoMediaBackend),
 }
 
 impl Default for IncompleteMediaBackendConfig {
@@ -600,6 +610,8 @@ pub enum MediaBackendConfig {
         directory_structure: DirectoryStructure,
     },
     S3(S3MediaBackend),
+    #[cfg(feature = "turso")]
+    Turso(TursoMediaBackend),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -706,6 +718,74 @@ pub struct S3MediaBackend {
     pub duration: Duration,
     pub path: Option<String>,
     pub directory_structure: DirectoryStructure,
+}
+
+/// Server-side at-rest encryption settings for the chunked Turso media backend.
+///
+/// Each media file is split into chunks of at most `chunk_size`, every chunk is
+/// encrypted with AES-256-GCM using a per-file key derived (HKDF-SHA256, bound
+/// to the file's content hash) from `master_key`, and the ciphertext chunks are
+/// stored in the `media_chunks` table of the main Turso database, alongside
+/// per-chunk SHA-256 hashes that can be retrieved without transferring the
+/// chunk contents.
+///
+/// The master key is a secret: prefer providing it exclusively through the
+/// `CONDUIT_MEDIA_MASTER_KEY` environment variable instead of a config file.
+#[cfg(feature = "turso")]
+#[derive(Clone, Debug, Deserialize)]
+pub struct TursoMediaBackend {
+    /// 32-byte master key, hex-encoded as a 64-character string.
+    #[serde(default = "default_turso_media_master_key")]
+    pub master_key: String,
+    /// Maximum plaintext size of each stored chunk.
+    #[serde(default = "default_turso_media_chunk_size")]
+    pub chunk_size: ByteSize,
+}
+
+#[cfg(feature = "turso")]
+fn default_turso_media_master_key() -> String {
+    // The master key is a secret, so it is allowed to be provided exclusively
+    // via the environment, in which case it is never present in any config
+    // file. An empty value fails validation in `TryFrom<IncompleteConfig>`.
+    std::env::var("CONDUIT_MEDIA_MASTER_KEY").unwrap_or_default()
+}
+
+#[cfg(feature = "turso")]
+fn default_turso_media_chunk_size() -> ByteSize {
+    ByteSize::kib(512)
+}
+
+#[cfg(feature = "turso")]
+impl TursoMediaBackend {
+    /// Validates the backend settings, including the presence of the main
+    /// database's Turso connection settings which the media chunks are stored
+    /// in. The error type matches `TryFrom<IncompleteConfig> for Config`.
+    fn validate(&self, database: Option<&TursoConfig>) -> Result<(), &'static str> {
+        if self.master_key.is_empty() {
+            return Err("The Turso media backend requires a master key: set the CONDUIT_MEDIA_MASTER_KEY environment variable (or the `master_key` config key) to a 64-character hex string encoding a 32-byte key");
+        }
+
+        match hex::decode(&self.master_key) {
+            Ok(bytes) if bytes.len() == 32 => {}
+            _ => {
+                return Err(
+                    "The Turso media backend master key must be a 64-character hex string encoding a 32-byte key",
+                );
+            }
+        }
+
+        if self.chunk_size.0 == 0 {
+            return Err("The Turso media backend chunk size must be greater than zero");
+        }
+
+        if database.is_none() {
+            return Err(
+                "The Turso media backend requires the [global.turso] database config (CONDUIT_TURSO_URL)",
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

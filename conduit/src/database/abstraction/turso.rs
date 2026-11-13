@@ -115,7 +115,7 @@ impl Engine {
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS media_chunks (file_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, chunk_data BLOB NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (file_id, chunk_index))",
+                "CREATE TABLE IF NOT EXISTS media_chunks (file_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, chunk_data BLOB NOT NULL, chunk_hash BLOB, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (file_id, chunk_index))",
                 libsql::params![],
             )
             .await
@@ -126,6 +126,35 @@ impl Engine {
             )
             .await
             .map_err(|e| Error::LibSql(e.to_string()))?;
+
+            // Databases created before the chunked media backend existed have a
+            // media_chunks table without the chunk_hash column; add it if missing.
+            let mut cursor = conn
+                .query("PRAGMA table_info(media_chunks)", libsql::params![])
+                .await
+                .map_err(|e| Error::LibSql(e.to_string()))?;
+            let mut has_chunk_hash = false;
+            while let Some(row) = cursor
+                .next()
+                .await
+                .map_err(|e| Error::LibSql(e.to_string()))?
+            {
+                let name: String = row.get(1).map_err(|e| Error::LibSql(e.to_string()))?;
+                if name == "chunk_hash" {
+                    has_chunk_hash = true;
+                }
+            }
+            drop(cursor);
+
+            if !has_chunk_hash {
+                conn.execute(
+                    "ALTER TABLE media_chunks ADD COLUMN chunk_hash BLOB",
+                    libsql::params![],
+                )
+                .await
+                .map_err(|e| Error::LibSql(e.to_string()))?;
+            }
+
             Ok(())
         })
     }

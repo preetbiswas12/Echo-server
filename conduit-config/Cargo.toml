@@ -14,6 +14,8 @@ bytesize = { workspace = true, features = ["serde"] }
 humantime-serde = "1"
 # Validating urls
 url = { version = "2", features = ["serde"] }
+# Validating the Turso media backend master key
+hex = "0.4"
 # Error type
 thiserror.workspace = true
 # Validating S3 config

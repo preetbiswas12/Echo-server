@@ -1,4 +1,6 @@
 mod data;
+#[cfg(feature = "backend_turso")]
+mod turso_chunks;
 use std::{io::Cursor, sync::Arc};
 
 use conduit_config::{DirectoryStructure, MediaBackendConfig, S3MediaBackend};
@@ -665,6 +667,12 @@ impl Service {
 
                 resp.bytes().await?.to_vec()
             }
+            #[cfg(feature = "backend_turso")]
+            MediaBackendConfig::Turso(turso_media) => {
+                turso_chunk_store(turso_media)?
+                    .get_file(&hex::encode(sha256_digest))
+                    .await?
+            }
         };
 
         if let Some((server_name, media_id)) = original_file_id {
@@ -682,6 +690,45 @@ impl Service {
             .transpose()
             .unwrap_or_else(|| Err(Error::BadRequest(ErrorKind::NotFound, "Fi)le not found")))
     }
+
+    /// Returns the stored `(chunk_index, chunk_hash)` pairs for a file,
+    /// without transferring any chunk contents.
+    ///
+    /// Only supported by the Turso chunked media backend.
+    #[cfg(feature = "backend_turso")]
+    pub async fn chunk_hashes(&self, sha256_hex: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+        let MediaBackendConfig::Turso(turso_media) = &services().globals.config.media.backend
+        else {
+            return Err(Error::TursoMedia(
+                "media chunks are only stored when the Turso media backend is configured"
+                    .to_owned(),
+            ));
+        };
+
+        turso_chunk_store(turso_media)?
+            .chunk_hashes(sha256_hex)
+            .await
+    }
+}
+
+/// Builds the Turso chunk store from the configured media backend settings and
+/// the main database's Turso connection settings.
+#[cfg(feature = "backend_turso")]
+fn turso_chunk_store(
+    turso_media: &conduit_config::TursoMediaBackend,
+) -> Result<turso_chunks::TursoChunkStore> {
+    let database = services()
+        .globals
+        .config
+        .turso
+        .as_ref()
+        .ok_or_else(|| {
+            Error::TursoMedia(
+                "the Turso media backend requires the [global.turso] database config".to_owned(),
+            )
+        })?;
+
+    turso_chunks::TursoChunkStore::new(turso_media, database)
 }
 
 /// Creates the media file, using the configured media backend
@@ -732,6 +779,12 @@ pub async fn create_file(sha256_hex: &str, file: &[u8]) -> Result<()> {
                 ));
             }
         }
+        #[cfg(feature = "backend_turso")]
+        MediaBackendConfig::Turso(turso_media) => {
+            turso_chunk_store(turso_media)?
+                .create_file(sha256_hex, file)
+                .await?;
+        }
     }
 
     Ok(())
@@ -775,6 +828,20 @@ async fn purge_files(hashes: Vec<Result<String>>) -> Vec<Error> {
                 }
             }
         }
+        #[cfg(feature = "backend_turso")]
+        MediaBackendConfig::Turso(turso_media) => match turso_chunk_store(turso_media) {
+            Ok(store) => match store.delete_files(&to_delete).await {
+                Ok(errors) => {
+                    result.extend(errors);
+                }
+                Err(error) => {
+                    result.push(error);
+                }
+            },
+            Err(error) => {
+                result.push(error);
+            }
+        },
     }
 
     result
