@@ -844,6 +844,7 @@ version = "0.11.0-alpha"
 dependencies = [
  "bytesize",
  "conduit-macros",
+ "figment",
  "hex",
  "humantime-serde",
  "reqwest",

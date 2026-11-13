@@ -2,18 +2,65 @@
 # Loaded via CONDUIT_CONFIG=/app/conduit.toml in the Docker image.
 # Env vars (CONDUIT_*) still override anything set here.
 
+# ── Rate limiting ────────────────────────────────────────────────────────────
+# Conduit's limiter has no "disable" switch: every value must be non-zero.
+# Instead, each limit is set so high it can never be reached in practice:
+# per_second = 100000 advances the bucket by 10 microseconds per request and
+# burst_capacity = 100000 allows 100k requests instantly.
+#
+# Bucket semantics (conduit/src/service/rate_limiting/mod.rs):
+#   client.global = ONE server-wide bucket per restriction (shared by all users)
+#   client.target = one bucket per user (authentication_failures is per IP)
+# Both scopes are set to effectively-unlimited below.
+#
+# `inherits = "public_large"` is chosen for its lenient authentication_failures
+# limiter (1 failed login per minute, burst 20, per IP), which cannot be
+# overridden via TOML: the flattened shadow schema feeds unknown keys to the
+# restriction map first, so an `authentication_failures` key fails to parse as
+# a ClientRestriction variant (see conduit-config/tests/rate_limiting_overrides.rs).
+# Every other public_large value is either overridden below or federation-only,
+# and federation is disabled on this server.
+
 [global.rate_limiting]
-# private_medium preset: auth-failure limiter 10/hour (burst 20) instead of
-# private_small's 1/hour, which caused lockouts on phone clients.
-inherits = "private_medium"
+inherits = "public_large"
 
-# Global (per-IP) client limits — bumped for login lockout and message/push throughput.
 [global.rate_limiting.client.global]
-login = { per_hour = 100, burst_capacity = 50 }
-send_event = { per_second = 10, burst_capacity = 100 }
+registration = { per_second = 100000, burst_capacity = 100000 }
+login = { per_second = 100000, burst_capacity = 100000 }
+registration_token_validity = { per_second = 100000, burst_capacity = 100000 }
+send_event = { per_second = 100000, burst_capacity = 100000 }
+join = { per_second = 100000, burst_capacity = 100000 }
+knock = { per_second = 100000, burst_capacity = 100000 }
+invite = { per_second = 100000, burst_capacity = 100000 }
+send_report = { per_second = 100000, burst_capacity = 100000 }
+create_alias = { per_second = 100000, burst_capacity = 100000 }
+media_download = { per_second = 100000, burst_capacity = 100000 }
+media_create = { per_second = 100000, burst_capacity = 100000 }
 
-# Federation limits intentionally left at preset defaults (federation is disabled
-# anyway); this empty table is required by the config schema.
-# NOTE: `authentication_failures` cannot be overridden via TOML in this fork
-# (schema limitation), so we rely on the private_medium preset for it.
+# Media bandwidth is counted in bytes, not requests; raised to match above.
+[global.rate_limiting.client.global.media]
+download = { per_second = "10 GB", burst_capacity = "100 GB" }
+upload = { per_second = "10 GB", burst_capacity = "100 GB" }
+fetch = { per_second = "10 GB", burst_capacity = "100 GB" }
+
+[global.rate_limiting.client.target]
+registration = { per_second = 100000, burst_capacity = 100000 }
+login = { per_second = 100000, burst_capacity = 100000 }
+registration_token_validity = { per_second = 100000, burst_capacity = 100000 }
+send_event = { per_second = 100000, burst_capacity = 100000 }
+join = { per_second = 100000, burst_capacity = 100000 }
+knock = { per_second = 100000, burst_capacity = 100000 }
+invite = { per_second = 100000, burst_capacity = 100000 }
+send_report = { per_second = 100000, burst_capacity = 100000 }
+create_alias = { per_second = 100000, burst_capacity = 100000 }
+media_download = { per_second = 100000, burst_capacity = 100000 }
+media_create = { per_second = 100000, burst_capacity = 100000 }
+
+[global.rate_limiting.client.target.media]
+download = { per_second = "10 GB", burst_capacity = "100 GB" }
+upload = { per_second = "10 GB", burst_capacity = "100 GB" }
+fetch = { per_second = "10 GB", burst_capacity = "100 GB" }
+
+# Federation: left at preset defaults. This empty table is required by the
+# config schema (the rate_limiting client/federation keys are mandatory).
 [global.rate_limiting.federation]

@@ -38,5 +38,9 @@ sqlite = []
 doc-generators = ["conduit-macros/doc-generators"]
 turso = []
 
+[dev-dependencies]
+# Parses the baked rate-limit overrides in tests the same way production does
+figment = { version = "0.10", features = ["toml"] }
+
 [lints]
 workspace = true
