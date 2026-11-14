@@ -18,6 +18,8 @@
 //! configured retention policy are purged through `purge_files`, which removes
 //! their chunks from the database.
 
+use std::sync::Arc;
+
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
@@ -31,7 +33,9 @@ use conduit_config::{TursoConfig, TursoMediaBackend};
 
 use crate::{Error, Result};
 
-use crate::database::abstraction::turso::{transactional_batch_with_retry, with_busy_retry};
+use crate::database::abstraction::turso::{
+    block_on, transactional_batch_with_retry, with_busy_retry,
+};
 
 /// HKDF info string binding derived keys to the Echo media chunk format.
 const KEY_INFO: &[u8] = b"echo-media-chunk";
@@ -44,11 +48,11 @@ const KEY_LEN: usize = 32;
 
 /// Chunked encrypted media storage in the main Turso database.
 ///
-/// Every operation opens its own libSQL connection, mirroring the synchronous
+/// All operations share the database's pooled HTTP connection, mirroring the
 /// key-value engine's usage pattern for the remote Turso backend.
 pub struct TursoChunkStore {
-    url: String,
-    auth_token: Option<String>,
+    /// Shared remote database handle so operations reuse pooled connections.
+    db: Arc<libsql::Database>,
     master_key: [u8; KEY_LEN],
     chunk_size: usize,
 }
@@ -75,9 +79,18 @@ impl TursoChunkStore {
             ));
         }
 
+        let db = block_on(async {
+            libsql::Builder::new_remote(
+                database.url.clone(),
+                database.auth_token.clone().unwrap_or_default(),
+            )
+            .build()
+            .await
+            .map_err(|e| Error::LibSql(e.to_string()))
+        })?;
+
         Ok(Self {
-            url: database.url.clone(),
-            auth_token: database.auth_token.clone(),
+            db: Arc::new(db),
             master_key,
             chunk_size,
         })
@@ -120,12 +133,7 @@ impl TursoChunkStore {
             statements.into_iter(),
             2 * 1024 * 1024,
         ) {
-            transactional_batch_with_retry(
-                self.url.clone(),
-                self.auth_token.clone().unwrap_or_default(),
-                group,
-            )
-            .await?;
+            transactional_batch_with_retry(self.db.clone(), group).await?;
         }
 
         Ok(())
@@ -276,18 +284,11 @@ impl TursoChunkStore {
         Ok(errors)
     }
 
+    /// Opens a connection on the shared database. Connections are cheap
+    /// handles over the pooled HTTP client, so this costs no round-trips.
     async fn connect(&self) -> Result<libsql::Connection> {
-        let db = libsql::Builder::new_remote(self.url.clone(), token_str(&self.auth_token))
-            .build()
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
-
-        db.connect().map_err(|e| Error::LibSql(e.to_string()))
+        self.db.connect().map_err(|e| Error::LibSql(e.to_string()))
     }
-}
-
-fn token_str(auth_token: &Option<String>) -> String {
-    auth_token.as_deref().unwrap_or("").to_string()
 }
 
 /// Decodes a sha256 hex file id into its 32-byte digest.

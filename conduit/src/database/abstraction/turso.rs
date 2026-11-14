@@ -1,4 +1,4 @@
-use super::{KeyValueDatabaseEngine, KvTree};
+use super::{KeyValueDatabaseEngine, KvTree, watchers::Watchers};
 use crate::{Result, utils::error::Error};
 use conduit_config::Config;
 use libsql::Builder;
@@ -10,6 +10,10 @@ type TupleOfBytes = (Vec<u8>, Vec<u8>);
 pub struct Engine {
     pub url: String,
     pub auth_token: Option<String>,
+    /// The shared remote database: one pooled HTTP client, so statements reuse
+    /// keep-alive connections instead of paying a fresh DNS lookup and TLS
+    /// handshake per statement.
+    pub db: Arc<libsql::Database>,
 }
 
 impl KeyValueDatabaseEngine for Arc<Engine> {
@@ -20,9 +24,19 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
             )
         })?;
 
+        let url = turso.url.clone();
+        let auth_token = turso.auth_token.clone();
+        let db = block_on(async {
+            Builder::new_remote(url.clone(), token_str(&auth_token))
+                .build()
+                .await
+                .map_err(|e| Error::LibSql(e.to_string()))
+        })?;
+
         let engine = Engine {
-            url: turso.url.clone(),
-            auth_token: turso.auth_token.clone(),
+            url,
+            auth_token,
+            db: Arc::new(db),
         };
 
         // Validate connectivity and ensure auxiliary tables exist (e.g. media chunk storage).
@@ -32,11 +46,11 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
     }
 
     fn open_tree(&self, name: &'static str) -> Result<Arc<dyn KvTree>> {
-        ensure_kv_table(&self.url, &self.auth_token, name)?;
+        ensure_kv_table(&self.db, name)?;
         Ok(Arc::new(TursoTable {
-            url: self.url.clone(),
-            auth_token: self.auth_token.clone(),
             name: name.to_owned(),
+            db: self.db.clone(),
+            watchers: Watchers::default(),
         }))
     }
 
@@ -54,7 +68,7 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
 /// When called inside an existing Tokio runtime (normal startup/request path),
 /// use `block_in_place` + the current handle to avoid "runtime within runtime"
 /// panics. Otherwise (e.g. isolated contexts), create a temporary runtime.
-fn block_on<F, T>(f: F) -> Result<T>
+pub(crate) fn block_on<F, T>(f: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
@@ -201,19 +215,13 @@ pub(crate) fn inline_sql_groups(
 /// that was left holding an open, but lock-free, transaction after a failed
 /// attempt is never reused.
 pub(crate) async fn transactional_batch_with_retry(
-    url: String,
-    token: String,
+    db: Arc<libsql::Database>,
     sql: String,
 ) -> Result<()> {
     with_busy_retry(|| {
-        let url = url.clone();
-        let token = token.clone();
+        let db = db.clone();
         let sql = sql.clone();
         async move {
-            let db = Builder::new_remote(url, token)
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             conn.execute_transactional_batch(&sql)
                 .await
@@ -224,20 +232,14 @@ pub(crate) async fn transactional_batch_with_retry(
     .await
 }
 
-fn ensure_kv_table(url: &str, auth_token: &Option<String>, name: &str) -> Result<()> {
+fn ensure_kv_table(db: &Arc<libsql::Database>, name: &str) -> Result<()> {
     if !is_safe_identifier(name) {
         return Err(Error::Initialization("invalid Turso table name"));
     }
-    let url = url.to_owned();
-    let token = token_str(auth_token);
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{name}\" (\"key\" BLOB PRIMARY KEY, \"value\" BLOB NOT NULL)"
     );
-    block_on(async move {
-        let db = Builder::new_remote(url, token)
-            .build()
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
+    block_on(async {
         let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
         exec_with_retry(&conn, &sql, Vec::new()).await
     })
@@ -245,14 +247,8 @@ fn ensure_kv_table(url: &str, auth_token: &Option<String>, name: &str) -> Result
 
 impl Engine {
     fn ensure_aux_tables(&self) -> Result<()> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
-        block_on(async move {
-            let db = Builder::new_remote(url, token)
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+        block_on(async {
+            let conn = self.db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             exec_with_retry(
                 &conn,
                 "CREATE TABLE IF NOT EXISTS media_chunks (file_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, chunk_data BLOB NOT NULL, chunk_hash BLOB, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (file_id, chunk_index))",
@@ -300,23 +296,18 @@ impl Engine {
 }
 
 pub struct TursoTable {
-    pub url: String,
-    pub auth_token: Option<String>,
     pub name: String,
+    pub db: Arc<libsql::Database>,
+    watchers: Watchers,
 }
 
 impl KvTree for TursoTable {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
         let key = key.to_vec();
 
         block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             let mut cursor = conn
                 .query(
@@ -338,20 +329,19 @@ impl KvTree for TursoTable {
     }
 
     fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
         let key = key.to_vec();
         let value = value.to_vec();
 
         block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             let sql = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
-            exec_with_retry(&conn, &sql, vec![key.into(), value.into()]).await
+            let result = exec_with_retry(&conn, &sql, vec![key.clone().into(), value.into()]).await;
+            if result.is_ok() {
+                self.watchers.wake(&key);
+            }
+            result
         })
     }
 
@@ -359,9 +349,8 @@ impl KvTree for TursoTable {
         &self,
         iter: &mut dyn Iterator<Item = (Vec<u8>, Vec<u8>)>,
     ) -> Result<()> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = iter.collect();
 
         if pairs.is_empty() {
@@ -384,7 +373,12 @@ impl KvTree for TursoTable {
             );
 
             for sql in groups {
-                transactional_batch_with_retry(url.clone(), token.clone(), sql).await?;
+                transactional_batch_with_retry(db.clone(), sql).await?;
+            }
+
+            // Wake sync watchers for every key that changed.
+            for (key, _) in &pairs {
+                self.watchers.wake(key);
             }
 
             Ok(())
@@ -392,16 +386,11 @@ impl KvTree for TursoTable {
     }
 
     fn remove(&self, key: &[u8]) -> Result<()> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
         let key = key.to_vec();
 
         block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             let sql = format!("DELETE FROM {} WHERE key = ?1", name);
             exec_with_retry(&conn, &sql, vec![key.into()]).await
@@ -410,15 +399,10 @@ impl KvTree for TursoTable {
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = TupleOfBytes> + 'a> {
         // Fetch all rows upfront into a Vec, then return a standard iterator.
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
 
         let rows = block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             let mut cursor = conn
                 .query(
@@ -458,16 +442,11 @@ impl KvTree for TursoTable {
         from: &[u8],
         backwards: bool,
     ) -> Box<dyn Iterator<Item = TupleOfBytes> + 'a> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
         let from = from.to_vec();
 
         let rows = block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
 
             let sql = if backwards {
@@ -513,16 +492,11 @@ impl KvTree for TursoTable {
     }
 
     fn increment(&self, key: &[u8]) -> Result<Vec<u8>> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
         let key = key.to_vec();
 
         block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             let sql_select = format!("SELECT value FROM {} WHERE key = ?1", name);
             let sql_cas = format!(
@@ -580,6 +554,7 @@ impl KvTree for TursoTable {
                 .await?;
 
                 if changed > 0 {
+                    self.watchers.wake(&key);
                     return Ok(new);
                 }
 
@@ -596,9 +571,8 @@ impl KvTree for TursoTable {
     }
 
     fn increment_batch<'a>(&self, iter: &mut dyn Iterator<Item = Vec<u8>>) -> Result<()> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
 
         // Deduplicate while collecting: a repeated key would increment twice.
         let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -614,10 +588,6 @@ impl KvTree for TursoTable {
         }
 
         block_on(async move {
-            let db = Builder::new_remote(url.clone(), token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
 
             // Read every counter's old value in a single request.
@@ -684,7 +654,13 @@ impl KvTree for TursoTable {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            transactional_batch_with_retry(url, token, sql).await
+            let result = transactional_batch_with_retry(db, sql).await;
+            if result.is_ok() {
+                for key in &keys {
+                    self.watchers.wake(key);
+                }
+            }
+            result
         })
     }
 
@@ -698,22 +674,17 @@ impl KvTree for TursoTable {
         )
     }
 
-    fn watch_prefix<'a>(&'a self, _prefix: &[u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        // Turso over HTTP does not support change feeds. Return a future that
-        // resolves immediately — cache invalidation via watch is a no-op.
-        Box::pin(async {})
+    fn watch_prefix<'a>(&'a self, prefix: &[u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        // Long-poll sync waits on this: it resolves when a write touches a key
+        // under the prefix (see the wake calls in the mutation paths).
+        self.watchers.watch(prefix)
     }
 
     fn clear(&self) -> Result<()> {
-        let url = self.url.clone();
-        let token = token_str(&self.auth_token);
         let name = self.name.clone();
+        let db = self.db.clone();
 
         block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             let sql = format!("DELETE FROM {}", name);
             exec_with_retry(&conn, &sql, Vec::new()).await
