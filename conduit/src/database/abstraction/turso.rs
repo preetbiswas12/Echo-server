@@ -2,7 +2,7 @@ use super::{KeyValueDatabaseEngine, KvTree};
 use crate::{Result, utils::error::Error};
 use conduit_config::Config;
 use libsql::Builder;
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt::Write as _, future::Future, pin::Pin, sync::Arc, time::Duration};
 use tracing::debug;
 
 type TupleOfBytes = (Vec<u8>, Vec<u8>);
@@ -91,6 +91,10 @@ fn is_busy_error(e: &Error) -> bool {
 /// reports its write lock as busy.
 const BUSY_RETRIES: usize = 6;
 
+/// How many times a compare-and-swap increment retries after losing the race
+/// to a concurrent writer.
+const CAS_ATTEMPTS: usize = 8;
+
 /// Runs an operation, retrying with exponential backoff while the remote
 /// database reports a busy/locked write lock.
 ///
@@ -130,12 +134,88 @@ async fn exec_with_retry(
     sql: &str,
     params: Vec<libsql::Value>,
 ) -> Result<()> {
+    exec_changed_with_retry(conn, sql, params).await.map(|_| ())
+}
+
+/// Executes a single statement and returns its affected row count, waiting out
+/// remote write-lock contention.
+async fn exec_changed_with_retry(
+    conn: &libsql::Connection,
+    sql: &str,
+    params: Vec<libsql::Value>,
+) -> Result<u64> {
     with_busy_retry(|| {
         let conn = conn.clone();
         let sql = sql.to_owned();
         let params = params.clone();
         async move {
             conn.execute(&sql, params)
+                .await
+                .map_err(|e| Error::LibSql(e.to_string()))
+        }
+    })
+    .await
+}
+
+/// Builds a SQLite blob literal (`X'ABCD..'`) for inlining raw bytes into
+/// batched SQL statements.
+pub(crate) fn blob_literal(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2 + 3);
+    out.push_str("X'");
+    for byte in bytes {
+        let _ = write!(out, "{byte:02X}");
+    }
+    out.push('\'');
+    out
+}
+
+/// Builds a quoted SQL text literal.
+pub(crate) fn text_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// Splits generated SQL statements into groups whose combined size stays under
+/// `max_bytes`, so each pipeline request stays within remote size limits.
+pub(crate) fn inline_sql_groups(
+    statements: impl Iterator<Item = String>,
+    max_bytes: usize,
+) -> Vec<String> {
+    let mut groups = Vec::new();
+    let mut current = String::new();
+    for statement in statements {
+        if !current.is_empty() && current.len() + statement.len() > max_bytes {
+            groups.push(std::mem::take(&mut current));
+        }
+        current.push_str(&statement);
+        current.push('\n');
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+/// Runs a transactional batch (BEGIN and COMMIT are injected by the client and
+/// the whole batch travels as one pipeline request), waiting out remote
+/// write-lock contention. Each attempt opens a fresh connection so a stream
+/// that was left holding an open, but lock-free, transaction after a failed
+/// attempt is never reused.
+pub(crate) async fn transactional_batch_with_retry(
+    url: String,
+    token: String,
+    sql: String,
+) -> Result<()> {
+    with_busy_retry(|| {
+        let url = url.clone();
+        let token = token.clone();
+        let sql = sql.clone();
+        async move {
+            let db = Builder::new_remote(url, token)
+                .build()
+                .await
+                .map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            conn.execute_transactional_batch(&sql)
                 .await
                 .map(|_| ())
                 .map_err(|e| Error::LibSql(e.to_string()))
@@ -284,46 +364,30 @@ impl KvTree for TursoTable {
         let name = self.name.clone();
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = iter.collect();
 
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        // The rows are written as one or more transactional batches, each sent
+        // as a single pipeline request, so the remote write lock is held for
+        // fast server-side execution instead of one round-trip per row.
         block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
-                .build()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-            let sql = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
+            let groups = inline_sql_groups(
+                pairs.iter().map(|(key, value)| {
+                    format!(
+                        "INSERT OR REPLACE INTO {name} (key, value) VALUES ({}, {});",
+                        blob_literal(key),
+                        blob_literal(value)
+                    )
+                }),
+                2 * 1024 * 1024,
+            );
 
-            with_busy_retry(|| {
-                let conn = conn.clone();
-                let sql = sql.clone();
-                let pairs = pairs.clone();
-                async move {
-                    conn.execute("BEGIN", libsql::params![])
-                        .await
-                        .map_err(|e| Error::LibSql(e.to_string()))?;
+            for sql in groups {
+                transactional_batch_with_retry(url.clone(), token.clone(), sql).await?;
+            }
 
-                    let result = async {
-                        for (key, value) in pairs {
-                            conn.execute(&sql, libsql::params![key, value])
-                                .await
-                                .map_err(|e| Error::LibSql(e.to_string()))?;
-                        }
-                        conn.execute("COMMIT", libsql::params![])
-                            .await
-                            .map_err(|e| Error::LibSql(e.to_string()))?;
-                        Ok(())
-                    }
-                    .await;
-
-                    if result.is_err() {
-                        // Best effort rollback; dropping the connection also
-                        // aborts the transaction server-side.
-                        let _ = conn.execute("ROLLBACK", libsql::params![]).await;
-                    }
-
-                    result
-                }
-            })
-            .await
+            Ok(())
         })
     }
 
@@ -461,57 +525,68 @@ impl KvTree for TursoTable {
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
             let sql_select = format!("SELECT value FROM {} WHERE key = ?1", name);
-            let sql_insert = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
+            let sql_cas = format!(
+                "INSERT INTO {} (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = ?2 WHERE value = ?3",
+                name
+            );
 
-            with_busy_retry(|| {
-                let conn = conn.clone();
-                let sql_select = sql_select.clone();
-                let sql_insert = sql_insert.clone();
-                let key = key.clone();
-                async move {
-                    conn.execute("BEGIN", libsql::params![])
-                        .await
-                        .map_err(|e| Error::LibSql(e.to_string()))?;
-
-                    let result = async {
-                        let old: Option<Vec<u8>> = {
-                            let mut cursor = conn
-                                .query(&sql_select, libsql::params![key.clone()])
-                                .await
-                                .map_err(|e| Error::LibSql(e.to_string()))?;
-                            match cursor.next().await.map_err(|e| Error::LibSql(e.to_string()))? {
-                                Some(row) => {
-                                    Some(row.get(0).map_err(|e| Error::LibSql(e.to_string()))?)
-                                }
-                                None => None,
+            // Compare-and-swap increment: read the old value, then write the
+            // incremented value only if the stored value still equals the old
+            // one. No transaction is held open across the two round-trips, so
+            // the remote write lock is never kept while waiting on the
+            // network, and a lost race simply retries with a fresh read.
+            for _ in 0..CAS_ATTEMPTS {
+                let old: Option<Vec<u8>> = with_busy_retry(|| {
+                    let conn = conn.clone();
+                    let sql = sql_select.clone();
+                    let key = key.clone();
+                    async move {
+                        let mut cursor = conn
+                            .query(&sql, libsql::params![key])
+                            .await
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+                        match cursor
+                            .next()
+                            .await
+                            .map_err(|e| Error::LibSql(e.to_string()))?
+                        {
+                            Some(row) => {
+                                let value: Vec<u8> =
+                                    row.get(0).map_err(|e| Error::LibSql(e.to_string()))?;
+                                Ok(Some(value))
                             }
-                        };
-
-                        let new = crate::utils::increment(old.as_deref())
-                            .expect("utils::increment always returns Some");
-
-                        conn.execute(&sql_insert, libsql::params![key, new.clone()])
-                            .await
-                            .map_err(|e| Error::LibSql(e.to_string()))?;
-
-                        conn.execute("COMMIT", libsql::params![])
-                            .await
-                            .map_err(|e| Error::LibSql(e.to_string()))?;
-
-                        Ok(new)
+                            None => Ok(None),
+                        }
                     }
-                    .await;
+                })
+                .await?;
 
-                    if result.is_err() {
-                        // Best effort rollback; dropping the connection also
-                        // aborts the transaction server-side.
-                        let _ = conn.execute("ROLLBACK", libsql::params![]).await;
-                    }
+                let new = crate::utils::increment(old.as_deref())
+                    .expect("utils::increment always returns Some");
 
-                    result
+                // An absent old value is guarded with an empty blob, which no
+                // increment ever stores, so a row that appears concurrently is
+                // detected as a lost race instead of being clobbered.
+                let changed = exec_changed_with_retry(
+                    &conn,
+                    &sql_cas,
+                    vec![
+                        key.clone().into(),
+                        new.clone().into(),
+                        old.clone().unwrap_or_default().into(),
+                    ],
+                )
+                .await?;
+
+                if changed > 0 {
+                    return Ok(new);
                 }
-            })
-            .await
+            }
+
+            Err(Error::LibSql(
+                "increment lost the compare-and-swap race too many times".to_owned(),
+            ))
         })
     }
 
@@ -519,71 +594,92 @@ impl KvTree for TursoTable {
         let url = self.url.clone();
         let token = token_str(&self.auth_token);
         let name = self.name.clone();
-        let keys: Vec<Vec<u8>> = iter.collect();
+
+        // Deduplicate while collecting: a repeated key would increment twice.
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for key in iter {
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+
+        if keys.is_empty() {
+            return Ok(());
+        }
 
         block_on(async move {
-            let db = Builder::new_remote(url, token.clone())
+            let db = Builder::new_remote(url.clone(), token.clone())
                 .build()
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-            let sql_select = format!("SELECT value FROM {} WHERE key = ?1", name);
-            let sql_insert = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
 
-            with_busy_retry(|| {
-                let conn = conn.clone();
-                let sql_select = sql_select.clone();
-                let sql_insert = sql_insert.clone();
-                let keys = keys.clone();
-                async move {
-                    conn.execute("BEGIN", libsql::params![])
-                        .await
-                        .map_err(|e| Error::LibSql(e.to_string()))?;
+            // Read every counter's old value in a single request.
+            let placeholders = (1..=keys.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql_select = format!(
+                "SELECT key, value FROM {} WHERE key IN ({placeholders})",
+                name
+            );
+            let select_params: Vec<libsql::Value> =
+                keys.iter().map(|key| key.clone().into()).collect();
 
-                    let result = async {
-                        for key in keys {
-                            let old: Option<Vec<u8>> = {
-                                let mut cursor = conn
-                                    .query(&sql_select, libsql::params![key.clone()])
-                                    .await
-                                    .map_err(|e| Error::LibSql(e.to_string()))?;
-                                match cursor
-                                    .next()
-                                    .await
-                                    .map_err(|e| Error::LibSql(e.to_string()))?
-                                {
-                                    Some(row) => {
-                                        Some(row.get(0).map_err(|e| Error::LibSql(e.to_string()))?)
-                                    }
-                                    None => None,
-                                }
-                            };
-                            let new = crate::utils::increment(old.as_deref())
-                                .expect("utils::increment always returns Some");
-
-                            conn.execute(&sql_insert, libsql::params![key, new])
-                                .await
-                                .map_err(|e| Error::LibSql(e.to_string()))?;
-                        }
-
-                        conn.execute("COMMIT", libsql::params![])
+            let mut old_by_key: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+                keys.iter().map(|key| (key.clone(), None)).collect();
+            {
+                let mut cursor = with_busy_retry(|| {
+                    let conn = conn.clone();
+                    let sql = sql_select.clone();
+                    let params = select_params.clone();
+                    async move {
+                        conn.query(&sql, params)
                             .await
-                            .map_err(|e| Error::LibSql(e.to_string()))?;
-
-                        Ok(())
+                            .map_err(|e| Error::LibSql(e.to_string()))
                     }
-                    .await;
-
-                    if result.is_err() {
-                        // Best effort rollback; dropping the connection also
-                        // aborts the transaction server-side.
-                        let _ = conn.execute("ROLLBACK", libsql::params![]).await;
+                })
+                .await?;
+                while let Some(row) = cursor
+                    .next()
+                    .await
+                    .map_err(|e| Error::LibSql(e.to_string()))?
+                {
+                    let key: Vec<u8> = row.get(0).map_err(|e| Error::LibSql(e.to_string()))?;
+                    let value: Option<Vec<u8>> =
+                        row.get(1).map_err(|e| Error::LibSql(e.to_string()))?;
+                    if old_by_key.contains_key(&key) {
+                        old_by_key.insert(key, value);
                     }
-
-                    result
                 }
-            })
-            .await
+            }
+
+            // One transactional batch of compare-and-swap increments, sent as
+            // a single pipeline request: the remote write lock is held for one
+            // fast server-side execution instead of one round-trip per
+            // counter. A counter changed between the read and the batch keeps
+            // its stored value (the compare fails), which is benign for the
+            // notification counts this powers.
+            let sql = keys
+                .iter()
+                .map(|key| {
+                    let old = old_by_key.get(key).cloned().flatten();
+                    let new = crate::utils::increment(old.as_deref())
+                        .expect("utils::increment always returns Some");
+                    format!(
+                        "INSERT INTO {name} (key, value) VALUES ({}, {}) \
+                         ON CONFLICT(key) DO UPDATE SET value = {} WHERE value = {};",
+                        blob_literal(key),
+                        blob_literal(&new),
+                        blob_literal(&new),
+                        blob_literal(old.as_deref().unwrap_or(&[])),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            transactional_batch_with_retry(url, token, sql).await
         })
     }
 

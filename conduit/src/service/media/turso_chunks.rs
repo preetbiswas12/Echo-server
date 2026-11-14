@@ -31,7 +31,7 @@ use conduit_config::{TursoConfig, TursoMediaBackend};
 
 use crate::{Error, Result};
 
-use crate::database::abstraction::turso::with_busy_retry;
+use crate::database::abstraction::turso::{transactional_batch_with_retry, with_busy_retry};
 
 /// HKDF info string binding derived keys to the Echo media chunk format.
 const KEY_INFO: &[u8] = b"echo-media-chunk";
@@ -100,52 +100,35 @@ impl TursoChunkStore {
             })
             .collect::<Result<_>>()?;
 
-        let conn = self.connect().await?;
+        // The DELETE plus every chunk INSERT is sent as transactional batches
+        // — single pipeline requests — so the remote write lock is held for
+        // fast server-side execution instead of one round-trip per chunk.
+        let file_id_sql = crate::database::abstraction::turso::text_literal(file_id);
+        let mut statements = Vec::with_capacity(chunks.len() + 1);
+        statements.push(format!(
+            "DELETE FROM media_chunks WHERE file_id = {file_id_sql};"
+        ));
+        for (index, chunk, hash) in &chunks {
+            statements.push(format!(
+                "INSERT INTO media_chunks (file_id, chunk_index, chunk_data, chunk_hash) VALUES ({file_id_sql}, {index}, {}, {});",
+                crate::database::abstraction::turso::blob_literal(chunk),
+                crate::database::abstraction::turso::blob_literal(hash),
+            ));
+        }
 
-        with_busy_retry(|| {
-            let conn = conn.clone();
-            let chunks = chunks.clone();
-            let file_id = file_id.to_owned();
-            async move {
-                conn.execute("BEGIN", libsql::params![])
-                    .await
-                    .map_err(|e| Error::LibSql(e.to_string()))?;
+        for group in crate::database::abstraction::turso::inline_sql_groups(
+            statements.into_iter(),
+            2 * 1024 * 1024,
+        ) {
+            transactional_batch_with_retry(
+                self.url.clone(),
+                self.auth_token.clone().unwrap_or_default(),
+                group,
+            )
+            .await?;
+        }
 
-                let result = async {
-                    conn.execute(
-                        "DELETE FROM media_chunks WHERE file_id = ?1",
-                        libsql::params![file_id.as_str()],
-                    )
-                    .await
-                    .map_err(|e| Error::LibSql(e.to_string()))?;
-
-                    for (index, chunk, hash) in chunks {
-                        conn.execute(
-                            "INSERT INTO media_chunks (file_id, chunk_index, chunk_data, chunk_hash) VALUES (?1, ?2, ?3, ?4)",
-                            libsql::params![file_id.as_str(), index, chunk, hash],
-                        )
-                        .await
-                        .map_err(|e| Error::LibSql(e.to_string()))?;
-                    }
-
-                    conn.execute("COMMIT", libsql::params![])
-                        .await
-                        .map_err(|e| Error::LibSql(e.to_string()))?;
-
-                    Ok(())
-                }
-                .await;
-
-                if result.is_err() {
-                    // Best effort rollback; dropping the connection also
-                    // aborts the transaction server-side.
-                    let _ = conn.execute("ROLLBACK", libsql::params![]).await;
-                }
-
-                result
-            }
-        })
-        .await
+        Ok(())
     }
 
     /// Reads, verifies and reassembles the file stored under `file_id`.
