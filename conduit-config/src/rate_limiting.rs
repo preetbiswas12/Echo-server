@@ -831,8 +831,8 @@ impl Config {
                         map: target_client_map,
                         media: target_client_media,
                         additional_fields: AuthenticationFailures::new(
-                            Timeframe::PerMinute(nz(1)),
-                            nz(20),
+                            Timeframe::PerMinute(nz(600)),
+                            nz(600),
                         ),
                     },
                     federation: ConfigFragmentFragment {

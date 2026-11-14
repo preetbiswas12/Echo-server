@@ -9,8 +9,9 @@
 //! Note: `authentication_failures` cannot be overridden via TOML. The flattened
 //! shadow-fragment schema feeds unknown keys to the restriction map first, so
 //! the key fails to parse as a `ClientRestriction` variant. The baked config
-//! therefore inherits the lenient `public_large` value for it, which is
-//! asserted here to keep the intent documented.
+//! therefore inherits the public_large value for it — 600 failed logins per
+//! minute (burst 600) per IP, raised from upstream's 1-per-minute (burst 20) —
+//! which is asserted here to keep the intent documented.
 
 use conduit_config::rate_limiting::{
     ClientRestriction, Config as RateLimitingConfig, FederationRestriction, MediaLimitation,
@@ -104,7 +105,10 @@ fn every_client_restriction_is_effectively_unlimited() {
 fn authentication_failures_falls_back_to_public_large_preset() {
     // The flatten-buffer schema makes this field impossible to override via
     // TOML (see module docs), so the baked config relies on
-    // `inherits = "public_large"`: 1 failed login per minute (burst 20) per IP.
+    // `inherits = "public_large"`: 600 failed logins per minute (burst 600)
+    // per IP. Raised from the upstream 1-per-minute (burst 20), which was
+    // low enough that a client retrying with a stale access token could lock
+    // its own IP out of the server for a minute at a time.
     let config = baked();
 
     let authentication_failures = &config
@@ -116,11 +120,11 @@ fn authentication_failures_falls_back_to_public_large_preset() {
     assert!(
         matches!(
             &authentication_failures.timeframe,
-            Timeframe::PerMinute(value) if value.get() == 1
+            Timeframe::PerMinute(value) if value.get() == 600
         ),
-        "public_large authentication_failures is 1 per minute, got {authentication_failures:?}",
+        "public_large authentication_failures is 600 per minute, got {authentication_failures:?}",
     );
-    assert_eq!(authentication_failures.burst_capacity.get(), 20);
+    assert_eq!(authentication_failures.burst_capacity.get(), 600);
 }
 
 #[test]

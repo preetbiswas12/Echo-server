@@ -35,13 +35,15 @@ accessed = "60days"
 #   client.target = one bucket per user (authentication_failures is per IP)
 # Both scopes are set to effectively-unlimited below.
 #
-# `inherits = "public_large"` is chosen for its lenient authentication_failures
-# limiter (1 failed login per minute, burst 20, per IP), which cannot be
-# overridden via TOML: the flattened shadow schema feeds unknown keys to the
-# restriction map first, so an `authentication_failures` key fails to parse as
-# a ClientRestriction variant (see conduit-config/tests/rate_limiting_overrides.rs).
-# Every other public_large value is either overridden below or federation-only,
-# and federation is disabled on this server.
+# `inherits = "public_large"` is chosen for its authentication_failures
+# limiter, which cannot be overridden via TOML: the flattened shadow schema
+# feeds unknown keys to the restriction map first, so an `authentication_failures`
+# key fails to parse as a ClientRestriction variant (see conduit-config/tests/rate_limiting_overrides.rs).
+# The fork raised the public_large default from upstream's 1 failed login per
+# minute (burst 20, per IP) to 600 per minute (burst 600), because the old
+# value let a client retrying with a stale access token lock its own IP out
+# of the server. Every other public_large value is either overridden below or
+# federation-only, and federation is disabled on this server.
 
 [global.rate_limiting]
 inherits = "public_large"

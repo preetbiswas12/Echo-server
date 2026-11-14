@@ -49,32 +49,46 @@ impl service::users::Data for KeyValueDatabase {
     }
 
     /// Find out which user an access token belongs to.
+    ///
+    /// Tokens whose device no longer has metadata (e.g. rows left inconsistent
+    /// by a partially-completed write sequence against a remote database) are
+    /// treated as unknown: the stale index row is removed and `None` is
+    /// returned, so the client gets an unknown-token error and signs in again
+    /// instead of operating on a phantom device.
     fn find_from_token(&self, token: &str) -> Result<Option<(OwnedUserId, OwnedDeviceId)>> {
-        self.token_userdeviceid
-            .get(token.as_bytes())?
-            .map_or(Ok(None), |bytes| {
-                let mut parts = bytes.split(|&b| b == 0xff);
-                let user_bytes = parts.next().ok_or_else(|| {
-                    Error::bad_database("User ID in token_userdeviceid is invalid.")
-                })?;
-                let device_bytes = parts.next().ok_or_else(|| {
-                    Error::bad_database("Device ID in token_userdeviceid is invalid.")
-                })?;
+        let Some(bytes) = self.token_userdeviceid.get(token.as_bytes())? else {
+            return Ok(None);
+        };
 
-                Ok(Some((
-                    UserId::parse(utils::string_from_bytes(user_bytes).map_err(|_| {
-                        Error::bad_database("User ID in token_userdeviceid is invalid unicode.")
-                    })?)
-                    .map_err(|_| {
-                        Error::bad_database("User ID in token_userdeviceid is invalid.")
-                    })?,
-                    utils::string_from_bytes(device_bytes)
-                        .map_err(|_| {
-                            Error::bad_database("Device ID in token_userdeviceid is invalid.")
-                        })?
-                        .into(),
-                )))
-            })
+        let mut parts = bytes.split(|&b| b == 0xff);
+        let user_bytes = parts
+            .next()
+            .ok_or_else(|| Error::bad_database("User ID in token_userdeviceid is invalid."))?;
+        let device_bytes = parts
+            .next()
+            .ok_or_else(|| Error::bad_database("Device ID in token_userdeviceid is invalid."))?;
+
+        let user_id = UserId::parse(
+            utils::string_from_bytes(user_bytes)
+                .map_err(|_| Error::bad_database("User ID in token_userdeviceid is invalid unicode."))?,
+        )
+        .map_err(|_| Error::bad_database("User ID in token_userdeviceid is invalid."))?;
+        let device_id: OwnedDeviceId = utils::string_from_bytes(device_bytes)
+            .map_err(|_| Error::bad_database("Device ID in token_userdeviceid is invalid."))?
+            .into();
+
+        let mut userdeviceid = user_id.as_bytes().to_vec();
+        userdeviceid.push(0xff);
+        userdeviceid.extend_from_slice(device_id.as_bytes());
+
+        if self.userdeviceid_metadata.get(&userdeviceid)?.is_none() {
+            // Stale token: the device was deleted without the token index being
+            // cleaned up. Drop the row so the token stops authenticating.
+            self.token_userdeviceid.remove(token.as_bytes())?;
+            return Ok(None);
+        }
+
+        Ok(Some((user_id, device_id)))
     }
 
     /// Returns an iterator over all users on this homeserver.
@@ -193,8 +207,14 @@ impl service::users::Data for KeyValueDatabase {
         token: &str,
         initial_device_display_name: Option<String>,
     ) -> Result<()> {
-        // This method should never be called for nonexistent users.
-        assert!(self.exists(user_id)?);
+        // This method should never be called for nonexistent users, but return
+        // a proper error instead of panicking if it ever happens.
+        if !self.exists(user_id)? {
+            return Err(Error::BadRequest(
+                ErrorKind::InvalidParam,
+                "User does not exist.",
+            ));
+        }
 
         let mut userdeviceid = user_id.as_bytes().to_vec();
         userdeviceid.push(0xff);
@@ -280,9 +300,10 @@ impl service::users::Data for KeyValueDatabase {
         userdeviceid.push(0xff);
         userdeviceid.extend_from_slice(device_id.as_bytes());
 
-        // All devices have metadata
-        assert!(self.userdeviceid_metadata.get(&userdeviceid)?.is_some());
-
+        // Devices normally always have metadata, but tolerate a missing row
+        // (e.g. after a partially-completed write against a remote database)
+        // instead of panicking: re-assigning the token is still valid and the
+        // next metadata write repairs the row.
         // Remove old token
         if let Some(old_token) = self.userdeviceid_token.get(&userdeviceid)? {
             self.token_userdeviceid.remove(&old_token)?;
@@ -309,10 +330,11 @@ impl service::users::Data for KeyValueDatabase {
         key.push(0xff);
         key.extend_from_slice(device_id.as_bytes());
 
-        // All devices have metadata
-        // Only existing devices should be able to call this.
-        assert!(self.userdeviceid_metadata.get(&key)?.is_some());
-
+        // Only existing devices should be able to call this, but the
+        // authenticated token is sufficient proof in practice: tolerate a
+        // missing metadata row (e.g. after a partially-completed write against
+        // a remote database) instead of panicking, so clients can still upload
+        // keys and make progress.
         key.push(0xff);
         // TODO: Use DeviceKeyId::to_string when it's available (and update everything,
         // because there are no wrapping quotation marks anymore)
@@ -845,8 +867,15 @@ impl service::users::Data for KeyValueDatabase {
         userdeviceid.push(0xff);
         userdeviceid.extend_from_slice(device_id.as_bytes());
 
-        // Only existing devices should be able to call this.
-        assert!(self.userdeviceid_metadata.get(&userdeviceid)?.is_some());
+        // Only existing devices should be able to call this. The route checks
+        // this too, but return a proper error instead of panicking if stale
+        // state slips through.
+        if self.userdeviceid_metadata.get(&userdeviceid)?.is_none() {
+            return Err(Error::BadRequest(
+                ErrorKind::NotFound,
+                "Device not found.",
+            ));
+        }
 
         self.userid_devicelistversion
             .increment(user_id.as_bytes())?;
