@@ -2,7 +2,7 @@ use super::{KeyValueDatabaseEngine, KvTree};
 use crate::{Result, utils::error::Error};
 use conduit_config::Config;
 use libsql::Builder;
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tracing::debug;
 
 type TupleOfBytes = (Vec<u8>, Vec<u8>);
@@ -82,6 +82,68 @@ fn is_safe_identifier(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+fn is_busy_error(e: &Error) -> bool {
+    let s = e.to_string();
+    s.contains("SQLITE_BUSY") || s.contains("database is locked")
+}
+
+/// How many times a database statement is retried while the remote database
+/// reports its write lock as busy.
+const BUSY_RETRIES: usize = 6;
+
+/// Runs an operation, retrying with exponential backoff while the remote
+/// database reports a busy/locked write lock.
+///
+/// Turso holds the write lock for the entire transaction of each concurrent
+/// writer, and this backend issues several statements per logical operation,
+/// so two overlapping write-heavy requests used to make one of them fail
+/// immediately with `SQLITE_BUSY`. Waiting a little and retrying instead turns
+/// that contention into latency rather than errors.
+pub(crate) async fn with_busy_retry<F, Fut, T>(mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut delay = Duration::from_millis(250);
+    let mut last_err = None;
+
+    for attempt in 0..BUSY_RETRIES {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(e) if is_busy_error(&e) => {
+                last_err = Some(e);
+                if attempt + 1 < BUSY_RETRIES {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.mul_f32(2.0).min(Duration::from_secs(2));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.expect("busy loop always records the last error"))
+}
+
+/// Executes a single statement, waiting out remote write-lock contention.
+async fn exec_with_retry(
+    conn: &libsql::Connection,
+    sql: &str,
+    params: Vec<libsql::Value>,
+) -> Result<()> {
+    with_busy_retry(|| {
+        let conn = conn.clone();
+        let sql = sql.to_owned();
+        let params = params.clone();
+        async move {
+            conn.execute(&sql, params)
+                .await
+                .map(|_| ())
+                .map_err(|e| Error::LibSql(e.to_string()))
+        }
+    })
+    .await
+}
+
 fn ensure_kv_table(url: &str, auth_token: &Option<String>, name: &str) -> Result<()> {
     if !is_safe_identifier(name) {
         return Err(Error::Initialization("invalid Turso table name"));
@@ -97,10 +159,7 @@ fn ensure_kv_table(url: &str, auth_token: &Option<String>, name: &str) -> Result
             .await
             .map_err(|e| Error::LibSql(e.to_string()))?;
         let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-        conn.execute(&sql, libsql::params![])
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
-        Ok(())
+        exec_with_retry(&conn, &sql, Vec::new()).await
     })
 }
 
@@ -114,18 +173,18 @@ impl Engine {
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-            conn.execute(
+            exec_with_retry(
+                &conn,
                 "CREATE TABLE IF NOT EXISTS media_chunks (file_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, chunk_data BLOB NOT NULL, chunk_hash BLOB, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (file_id, chunk_index))",
-                libsql::params![],
+                Vec::new(),
             )
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
-            conn.execute(
+            .await?;
+            exec_with_retry(
+                &conn,
                 "CREATE INDEX IF NOT EXISTS idx_media_chunks_created_at ON media_chunks(created_at)",
-                libsql::params![],
+                Vec::new(),
             )
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
+            .await?;
 
             // Databases created before the chunked media backend existed have a
             // media_chunks table without the chunk_hash column; add it if missing.
@@ -147,12 +206,12 @@ impl Engine {
             drop(cursor);
 
             if !has_chunk_hash {
-                conn.execute(
+                exec_with_retry(
+                    &conn,
                     "ALTER TABLE media_chunks ADD COLUMN chunk_hash BLOB",
-                    libsql::params![],
+                    Vec::new(),
                 )
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
+                .await?;
             }
 
             Ok(())
@@ -211,13 +270,8 @@ impl KvTree for TursoTable {
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-            conn.execute(
-                &format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name),
-                libsql::params![key, value],
-            )
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
-            Ok(())
+            let sql = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
+            exec_with_retry(&conn, &sql, vec![key.into(), value.into()]).await
         })
     }
 
@@ -236,22 +290,40 @@ impl KvTree for TursoTable {
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let sql = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
 
-            conn.execute("BEGIN", libsql::params![])
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-            for (key, value) in pairs {
-                conn.execute(
-                    &format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name),
-                    libsql::params![key, value],
-                )
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-            }
-            conn.execute("COMMIT", libsql::params![])
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-            Ok(())
+            with_busy_retry(|| {
+                let conn = conn.clone();
+                let sql = sql.clone();
+                let pairs = pairs.clone();
+                async move {
+                    conn.execute("BEGIN", libsql::params![])
+                        .await
+                        .map_err(|e| Error::LibSql(e.to_string()))?;
+
+                    let result = async {
+                        for (key, value) in pairs {
+                            conn.execute(&sql, libsql::params![key, value])
+                                .await
+                                .map_err(|e| Error::LibSql(e.to_string()))?;
+                        }
+                        conn.execute("COMMIT", libsql::params![])
+                            .await
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+                        Ok(())
+                    }
+                    .await;
+
+                    if result.is_err() {
+                        // Best effort rollback; dropping the connection also
+                        // aborts the transaction server-side.
+                        let _ = conn.execute("ROLLBACK", libsql::params![]).await;
+                    }
+
+                    result
+                }
+            })
+            .await
         })
     }
 
@@ -267,13 +339,8 @@ impl KvTree for TursoTable {
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-            conn.execute(
-                &format!("DELETE FROM {} WHERE key = ?1", name),
-                libsql::params![key],
-            )
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
-            Ok(())
+            let sql = format!("DELETE FROM {} WHERE key = ?1", name);
+            exec_with_retry(&conn, &sql, vec![key.into()]).await
         })
     }
 
@@ -393,43 +460,58 @@ impl KvTree for TursoTable {
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let sql_select = format!("SELECT value FROM {} WHERE key = ?1", name);
+            let sql_insert = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
 
-            conn.execute("BEGIN", libsql::params![])
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
+            with_busy_retry(|| {
+                let conn = conn.clone();
+                let sql_select = sql_select.clone();
+                let sql_insert = sql_insert.clone();
+                let key = key.clone();
+                async move {
+                    conn.execute("BEGIN", libsql::params![])
+                        .await
+                        .map_err(|e| Error::LibSql(e.to_string()))?;
 
-            let old: Option<Vec<u8>> = {
-                let mut cursor = conn
-                    .query(
-                        &format!("SELECT value FROM {} WHERE key = ?1", name),
-                        libsql::params![key.clone()],
-                    )
-                    .await
-                    .map_err(|e| Error::LibSql(e.to_string()))?;
-                match cursor.next().await.map_err(|e| Error::LibSql(e.to_string()))? {
-                    Some(row) => Some(
-                        row.get(0)
-                            .map_err(|e| Error::LibSql(e.to_string()))?,
-                    ),
-                    None => None,
+                    let result = async {
+                        let old: Option<Vec<u8>> = {
+                            let mut cursor = conn
+                                .query(&sql_select, libsql::params![key.clone()])
+                                .await
+                                .map_err(|e| Error::LibSql(e.to_string()))?;
+                            match cursor.next().await.map_err(|e| Error::LibSql(e.to_string()))? {
+                                Some(row) => {
+                                    Some(row.get(0).map_err(|e| Error::LibSql(e.to_string()))?)
+                                }
+                                None => None,
+                            }
+                        };
+
+                        let new = crate::utils::increment(old.as_deref())
+                            .expect("utils::increment always returns Some");
+
+                        conn.execute(&sql_insert, libsql::params![key, new.clone()])
+                            .await
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+
+                        conn.execute("COMMIT", libsql::params![])
+                            .await
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+
+                        Ok(new)
+                    }
+                    .await;
+
+                    if result.is_err() {
+                        // Best effort rollback; dropping the connection also
+                        // aborts the transaction server-side.
+                        let _ = conn.execute("ROLLBACK", libsql::params![]).await;
+                    }
+
+                    result
                 }
-            };
-
-            let new = crate::utils::increment(old.as_deref())
-                .expect("utils::increment always returns Some");
-
-            conn.execute(
-                &format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name),
-                libsql::params![key, new.clone()],
-            )
+            })
             .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
-
-            conn.execute("COMMIT", libsql::params![])
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-
-            Ok(new)
         })
     }
 
@@ -445,44 +527,63 @@ impl KvTree for TursoTable {
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let sql_select = format!("SELECT value FROM {} WHERE key = ?1", name);
+            let sql_insert = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
 
-            conn.execute("BEGIN", libsql::params![])
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-
-            for key in keys {
-                let old: Option<Vec<u8>> = {
-                    let mut cursor = conn
-                        .query(
-                            &format!("SELECT value FROM {} WHERE key = ?1", name),
-                            libsql::params![key.clone()],
-                        )
+            with_busy_retry(|| {
+                let conn = conn.clone();
+                let sql_select = sql_select.clone();
+                let sql_insert = sql_insert.clone();
+                let keys = keys.clone();
+                async move {
+                    conn.execute("BEGIN", libsql::params![])
                         .await
                         .map_err(|e| Error::LibSql(e.to_string()))?;
-                    match cursor.next().await.map_err(|e| Error::LibSql(e.to_string()))? {
-                        Some(row) => Some(
-                            row.get(0)
-                                .map_err(|e| Error::LibSql(e.to_string()))?,
-                        ),
-                        None => None,
+
+                    let result = async {
+                        for key in keys {
+                            let old: Option<Vec<u8>> = {
+                                let mut cursor = conn
+                                    .query(&sql_select, libsql::params![key.clone()])
+                                    .await
+                                    .map_err(|e| Error::LibSql(e.to_string()))?;
+                                match cursor
+                                    .next()
+                                    .await
+                                    .map_err(|e| Error::LibSql(e.to_string()))?
+                                {
+                                    Some(row) => {
+                                        Some(row.get(0).map_err(|e| Error::LibSql(e.to_string()))?)
+                                    }
+                                    None => None,
+                                }
+                            };
+                            let new = crate::utils::increment(old.as_deref())
+                                .expect("utils::increment always returns Some");
+
+                            conn.execute(&sql_insert, libsql::params![key, new])
+                                .await
+                                .map_err(|e| Error::LibSql(e.to_string()))?;
+                        }
+
+                        conn.execute("COMMIT", libsql::params![])
+                            .await
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+
+                        Ok(())
                     }
-                };
-                let new = crate::utils::increment(old.as_deref())
-                    .expect("utils::increment always returns Some");
+                    .await;
 
-                conn.execute(
-                    &format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name),
-                    libsql::params![key, new],
-                )
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-            }
+                    if result.is_err() {
+                        // Best effort rollback; dropping the connection also
+                        // aborts the transaction server-side.
+                        let _ = conn.execute("ROLLBACK", libsql::params![]).await;
+                    }
 
-            conn.execute("COMMIT", libsql::params![])
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-
-            Ok(())
+                    result
+                }
+            })
+            .await
         })
     }
 
@@ -513,13 +614,8 @@ impl KvTree for TursoTable {
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
             let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-            conn.execute(
-                &format!("DELETE FROM {}", name),
-                libsql::params![],
-            )
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
-            Ok(())
+            let sql = format!("DELETE FROM {}", name);
+            exec_with_retry(&conn, &sql, Vec::new()).await
         })
     }
 }

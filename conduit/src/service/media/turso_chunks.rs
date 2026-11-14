@@ -31,6 +31,8 @@ use conduit_config::{TursoConfig, TursoMediaBackend};
 
 use crate::{Error, Result};
 
+use crate::database::abstraction::turso::with_busy_retry;
+
 /// HKDF info string binding derived keys to the Echo media chunk format.
 const KEY_INFO: &[u8] = b"echo-media-chunk";
 /// AES-256-GCM nonce length in bytes.
@@ -100,42 +102,50 @@ impl TursoChunkStore {
 
         let conn = self.connect().await?;
 
-        conn.execute("BEGIN", libsql::params![])
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
+        with_busy_retry(|| {
+            let conn = conn.clone();
+            let chunks = chunks.clone();
+            let file_id = file_id.to_owned();
+            async move {
+                conn.execute("BEGIN", libsql::params![])
+                    .await
+                    .map_err(|e| Error::LibSql(e.to_string()))?;
 
-        let result = async {
-            conn.execute(
-                "DELETE FROM media_chunks WHERE file_id = ?1",
-                libsql::params![file_id],
-            )
-            .await
-            .map_err(|e| Error::LibSql(e.to_string()))?;
+                let result = async {
+                    conn.execute(
+                        "DELETE FROM media_chunks WHERE file_id = ?1",
+                        libsql::params![file_id.as_str()],
+                    )
+                    .await
+                    .map_err(|e| Error::LibSql(e.to_string()))?;
 
-            for (index, chunk, hash) in chunks {
-                conn.execute(
-                    "INSERT INTO media_chunks (file_id, chunk_index, chunk_data, chunk_hash) VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![file_id, index, chunk, hash],
-                )
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
+                    for (index, chunk, hash) in chunks {
+                        conn.execute(
+                            "INSERT INTO media_chunks (file_id, chunk_index, chunk_data, chunk_hash) VALUES (?1, ?2, ?3, ?4)",
+                            libsql::params![file_id.as_str(), index, chunk, hash],
+                        )
+                        .await
+                        .map_err(|e| Error::LibSql(e.to_string()))?;
+                    }
+
+                    conn.execute("COMMIT", libsql::params![])
+                        .await
+                        .map_err(|e| Error::LibSql(e.to_string()))?;
+
+                    Ok(())
+                }
+                .await;
+
+                if result.is_err() {
+                    // Best effort rollback; dropping the connection also
+                    // aborts the transaction server-side.
+                    let _ = conn.execute("ROLLBACK", libsql::params![]).await;
+                }
+
+                result
             }
-
-            conn.execute("COMMIT", libsql::params![])
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-
-            Ok(())
-        }
-        .await;
-
-        if result.is_err() {
-            // Best effort rollback; dropping the connection also aborts the
-            // transaction server-side.
-            let _ = conn.execute("ROLLBACK", libsql::params![]).await;
-        }
-
-        result
+        })
+        .await
     }
 
     /// Reads, verifies and reassembles the file stored under `file_id`.
@@ -261,12 +271,18 @@ impl TursoChunkStore {
         let mut errors = Vec::new();
 
         for file_id in file_ids {
-            if let Err(e) = conn
-                .execute(
-                    "DELETE FROM media_chunks WHERE file_id = ?1",
-                    libsql::params![file_id.as_str()],
-                )
-                .await
+            if let Err(e) = with_busy_retry(|| {
+                let conn = conn.clone();
+                let sql = "DELETE FROM media_chunks WHERE file_id = ?1".to_owned();
+                let file_id = file_id.clone();
+                async move {
+                    conn.execute(&sql, libsql::params![file_id])
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| Error::LibSql(e.to_string()))
+                }
+            })
+            .await
             {
                 errors.push(Error::LibSql(format!(
                     "failed to delete the media chunks of \"{file_id}\": {e}"

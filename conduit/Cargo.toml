@@ -43,7 +43,7 @@ tower-http = { version = "0.6", features = [
 tower-service = "0.3"
 
 # Async runtime and utilities
-tokio = { version = "1", features = ["fs", "macros", "signal", "sync"] }
+tokio = { version = "1", features = ["fs", "macros", "signal", "sync", "time"] }
 
 # Used for the http request / response body type for Ruma endpoints used with reqwest
 bytes = "1"
