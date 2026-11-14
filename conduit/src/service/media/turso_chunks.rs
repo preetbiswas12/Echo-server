@@ -34,7 +34,7 @@ use conduit_config::{TursoConfig, TursoMediaBackend};
 use crate::{Error, Result};
 
 use crate::database::abstraction::turso::{
-    block_on, transactional_batch_with_retry, with_busy_retry,
+    ConnPool, block_on, transactional_batch_with_retry, with_busy_retry,
 };
 
 /// HKDF info string binding derived keys to the Echo media chunk format.
@@ -51,8 +51,8 @@ const KEY_LEN: usize = 32;
 /// All operations share the database's pooled HTTP connection, mirroring the
 /// key-value engine's usage pattern for the remote Turso backend.
 pub struct TursoChunkStore {
-    /// Shared remote database handle so operations reuse pooled connections.
-    db: Arc<libsql::Database>,
+    /// Pool of persistent connections reused across operations.
+    pool: Arc<ConnPool>,
     master_key: [u8; KEY_LEN],
     chunk_size: usize,
 }
@@ -90,7 +90,7 @@ impl TursoChunkStore {
         })?;
 
         Ok(Self {
-            db: Arc::new(db),
+            pool: Arc::new(ConnPool::new(Arc::new(db))),
             master_key,
             chunk_size,
         })
@@ -133,7 +133,7 @@ impl TursoChunkStore {
             statements.into_iter(),
             2 * 1024 * 1024,
         ) {
-            transactional_batch_with_retry(self.db.clone(), group).await?;
+            transactional_batch_with_retry(self.pool.clone(), group).await?;
         }
 
         Ok(())
@@ -204,6 +204,7 @@ impl TursoChunkStore {
             )));
         }
 
+        self.pool.release(conn);
         Ok(file)
     }
 
@@ -246,6 +247,7 @@ impl TursoChunkStore {
             hashes.push((index as u64, hash));
         }
 
+        self.pool.release(conn);
         Ok(hashes)
     }
 
@@ -281,13 +283,14 @@ impl TursoChunkStore {
             }
         }
 
+        self.pool.release(conn);
         Ok(errors)
     }
 
-    /// Opens a connection on the shared database. Connections are cheap
-    /// handles over the pooled HTTP client, so this costs no round-trips.
+    /// Checks a connection out of the pool. Connections are cheap handles over
+    /// persistent HTTP clients, so this costs no round-trips.
     async fn connect(&self) -> Result<libsql::Connection> {
-        self.db.connect().map_err(|e| Error::LibSql(e.to_string()))
+        self.pool.acquire()
     }
 }
 

@@ -2,18 +2,59 @@ use super::{KeyValueDatabaseEngine, KvTree, watchers::Watchers};
 use crate::{Result, utils::error::Error};
 use conduit_config::Config;
 use libsql::Builder;
-use std::{fmt::Write as _, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    fmt::Write as _,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tracing::debug;
 
 type TupleOfBytes = (Vec<u8>, Vec<u8>);
 
+/// A pool of long-lived remote connections.
+///
+/// libsql builds a brand-new HTTP client (and therefore a brand-new, empty
+/// connection pool) inside every `Database::connect()` call, so opening a
+/// connection per statement pays a fresh DNS lookup, TCP connect, and TLS
+/// handshake to the remote database each time. Checking a small set of
+/// persistent connections out per operation instead amortizes that setup:
+/// every statement a pooled connection runs reuses its warm HTTPS connection.
+pub(crate) struct ConnPool {
+    db: Arc<libsql::Database>,
+    conns: Mutex<Vec<libsql::Connection>>,
+}
+
+impl ConnPool {
+    pub(crate) fn new(db: Arc<libsql::Database>) -> Self {
+        Self {
+            db,
+            conns: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Checks a connection out of the pool, creating one if the pool is empty.
+    ///
+    /// Callers must hand the connection back with [`ConnPool::release`] when
+    /// the operation succeeded. On error the connection is simply dropped, so
+    /// a session the server may have killed is never reused.
+    pub(crate) fn acquire(&self) -> Result<libsql::Connection> {
+        if let Some(conn) = self.conns.lock().unwrap().pop() {
+            return Ok(conn);
+        }
+        self.db.connect().map_err(|e| Error::LibSql(e.to_string()))
+    }
+
+    /// Returns a healthy connection to the pool.
+    pub(crate) fn release(&self, conn: libsql::Connection) {
+        self.conns.lock().unwrap().push(conn);
+    }
+}
+
 pub struct Engine {
-    pub url: String,
-    pub auth_token: Option<String>,
-    /// The shared remote database: one pooled HTTP client, so statements reuse
-    /// keep-alive connections instead of paying a fresh DNS lookup and TLS
-    /// handshake per statement.
-    pub db: Arc<libsql::Database>,
+    /// Persistent connections reused across statements and operations.
+    pub pool: Arc<ConnPool>,
 }
 
 impl KeyValueDatabaseEngine for Arc<Engine> {
@@ -24,19 +65,15 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
             )
         })?;
 
-        let url = turso.url.clone();
-        let auth_token = turso.auth_token.clone();
         let db = block_on(async {
-            Builder::new_remote(url.clone(), token_str(&auth_token))
+            Builder::new_remote(turso.url.clone(), token_str(&turso.auth_token))
                 .build()
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))
         })?;
 
         let engine = Engine {
-            url,
-            auth_token,
-            db: Arc::new(db),
+            pool: Arc::new(ConnPool::new(Arc::new(db))),
         };
 
         // Validate connectivity and ensure auxiliary tables exist (e.g. media chunk storage).
@@ -46,10 +83,10 @@ impl KeyValueDatabaseEngine for Arc<Engine> {
     }
 
     fn open_tree(&self, name: &'static str) -> Result<Arc<dyn KvTree>> {
-        ensure_kv_table(&self.db, name)?;
+        ensure_kv_table(&self.pool, name)?;
         Ok(Arc::new(TursoTable {
             name: name.to_owned(),
-            db: self.db.clone(),
+            pool: self.pool.clone(),
             watchers: Watchers::default(),
         }))
     }
@@ -211,28 +248,33 @@ pub(crate) fn inline_sql_groups(
 
 /// Runs a transactional batch (BEGIN and COMMIT are injected by the client and
 /// the whole batch travels as one pipeline request), waiting out remote
-/// write-lock contention. Each attempt opens a fresh connection so a stream
-/// that was left holding an open, but lock-free, transaction after a failed
-/// attempt is never reused.
+/// write-lock contention. Each attempt checks out a pooled connection; a failed
+/// attempt drops its connection, so a stream that was left holding an open,
+/// but lock-free, transaction after a failed attempt is never reused.
 pub(crate) async fn transactional_batch_with_retry(
-    db: Arc<libsql::Database>,
+    pool: Arc<ConnPool>,
     sql: String,
 ) -> Result<()> {
     with_busy_retry(|| {
-        let db = db.clone();
+        let pool = pool.clone();
         let sql = sql.clone();
         async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-            conn.execute_transactional_batch(&sql)
+            let conn = pool.acquire()?;
+            let result = conn
+                .execute_transactional_batch(&sql)
                 .await
                 .map(|_| ())
-                .map_err(|e| Error::LibSql(e.to_string()))
+                .map_err(|e| Error::LibSql(e.to_string()));
+            if result.is_ok() {
+                pool.release(conn);
+            }
+            result
         }
     })
     .await
 }
 
-fn ensure_kv_table(db: &Arc<libsql::Database>, name: &str) -> Result<()> {
+fn ensure_kv_table(pool: &Arc<ConnPool>, name: &str) -> Result<()> {
     if !is_safe_identifier(name) {
         return Err(Error::Initialization("invalid Turso table name"));
     }
@@ -240,15 +282,19 @@ fn ensure_kv_table(db: &Arc<libsql::Database>, name: &str) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS \"{name}\" (\"key\" BLOB PRIMARY KEY, \"value\" BLOB NOT NULL)"
     );
     block_on(async {
-        let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
-        exec_with_retry(&conn, &sql, Vec::new()).await
+        let conn = pool.acquire()?;
+        let result = exec_with_retry(&conn, &sql, Vec::new()).await;
+        if result.is_ok() {
+            pool.release(conn);
+        }
+        result
     })
 }
 
 impl Engine {
     fn ensure_aux_tables(&self) -> Result<()> {
         block_on(async {
-            let conn = self.db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = self.pool.acquire()?;
             exec_with_retry(
                 &conn,
                 "CREATE TABLE IF NOT EXISTS media_chunks (file_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, chunk_data BLOB NOT NULL, chunk_hash BLOB, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), PRIMARY KEY (file_id, chunk_index))",
@@ -290,6 +336,7 @@ impl Engine {
                 .await?;
             }
 
+            self.pool.release(conn);
             Ok(())
         })
     }
@@ -297,18 +344,18 @@ impl Engine {
 
 pub struct TursoTable {
     pub name: String,
-    pub db: Arc<libsql::Database>,
+    pool: Arc<ConnPool>,
     watchers: Watchers,
 }
 
 impl KvTree for TursoTable {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
         let key = key.to_vec();
 
         block_on(async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = pool.acquire()?;
             let mut cursor = conn
                 .query(
                     &format!("SELECT value FROM {} WHERE key = ?1", name),
@@ -316,29 +363,32 @@ impl KvTree for TursoTable {
                 )
                 .await
                 .map_err(|e| Error::LibSql(e.to_string()))?;
-            match cursor.next().await.map_err(|e| Error::LibSql(e.to_string()))? {
+            let value = match cursor.next().await.map_err(|e| Error::LibSql(e.to_string()))? {
                 Some(row) => {
                     let value: Vec<u8> = row
                         .get(0)
                         .map_err(|e| Error::LibSql(e.to_string()))?;
-                    Ok(Some(value))
+                    Some(value)
                 }
-                None => Ok(None),
-            }
+                None => None,
+            };
+            pool.release(conn);
+            Ok(value)
         })
     }
 
     fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
         let key = key.to_vec();
         let value = value.to_vec();
 
         block_on(async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = pool.acquire()?;
             let sql = format!("INSERT OR REPLACE INTO {} (key, value) VALUES (?1, ?2)", name);
             let result = exec_with_retry(&conn, &sql, vec![key.clone().into(), value.into()]).await;
             if result.is_ok() {
+                pool.release(conn);
                 self.watchers.wake(&key);
             }
             result
@@ -350,7 +400,7 @@ impl KvTree for TursoTable {
         iter: &mut dyn Iterator<Item = (Vec<u8>, Vec<u8>)>,
     ) -> Result<()> {
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = iter.collect();
 
         if pairs.is_empty() {
@@ -373,7 +423,7 @@ impl KvTree for TursoTable {
             );
 
             for sql in groups {
-                transactional_batch_with_retry(db.clone(), sql).await?;
+                transactional_batch_with_retry(pool.clone(), sql).await?;
             }
 
             // Wake sync watchers for every key that changed.
@@ -387,23 +437,27 @@ impl KvTree for TursoTable {
 
     fn remove(&self, key: &[u8]) -> Result<()> {
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
         let key = key.to_vec();
 
         block_on(async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = pool.acquire()?;
             let sql = format!("DELETE FROM {} WHERE key = ?1", name);
-            exec_with_retry(&conn, &sql, vec![key.into()]).await
+            let result = exec_with_retry(&conn, &sql, vec![key.into()]).await;
+            if result.is_ok() {
+                pool.release(conn);
+            }
+            result
         })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = TupleOfBytes> + 'a> {
         // Fetch all rows upfront into a Vec, then return a standard iterator.
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
 
         let rows = block_on(async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = pool.acquire()?;
             let mut cursor = conn
                 .query(
                     &format!("SELECT key, value FROM {} ORDER BY key ASC", name),
@@ -425,7 +479,9 @@ impl KvTree for TursoTable {
                     .map_err(|e| Error::LibSql(e.to_string()))?;
                 rows.push((key, value));
             }
-            Ok::<Vec<TupleOfBytes>, Error>(rows)
+            let out = Ok::<Vec<TupleOfBytes>, Error>(rows);
+            pool.release(conn);
+            out
         });
 
         match rows {
@@ -443,11 +499,11 @@ impl KvTree for TursoTable {
         backwards: bool,
     ) -> Box<dyn Iterator<Item = TupleOfBytes> + 'a> {
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
         let from = from.to_vec();
 
         let rows = block_on(async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = pool.acquire()?;
 
             let sql = if backwards {
                 format!(
@@ -479,7 +535,9 @@ impl KvTree for TursoTable {
                     .map_err(|e| Error::LibSql(e.to_string()))?;
                 rows.push((key, value));
             }
-            Ok::<Vec<TupleOfBytes>, Error>(rows)
+            let out = Ok::<Vec<TupleOfBytes>, Error>(rows);
+            pool.release(conn);
+            out
         });
 
         match rows {
@@ -493,11 +551,11 @@ impl KvTree for TursoTable {
 
     fn increment(&self, key: &[u8]) -> Result<Vec<u8>> {
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
         let key = key.to_vec();
 
         block_on(async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = pool.acquire()?;
             let sql_select = format!("SELECT value FROM {} WHERE key = ?1", name);
             let sql_cas = format!(
                 "INSERT INTO {} (key, value) VALUES (?1, ?2) \
@@ -555,6 +613,7 @@ impl KvTree for TursoTable {
 
                 if changed > 0 {
                     self.watchers.wake(&key);
+                    pool.release(conn);
                     return Ok(new);
                 }
 
@@ -572,7 +631,7 @@ impl KvTree for TursoTable {
 
     fn increment_batch<'a>(&self, iter: &mut dyn Iterator<Item = Vec<u8>>) -> Result<()> {
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
 
         // Deduplicate while collecting: a repeated key would increment twice.
         let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -588,7 +647,7 @@ impl KvTree for TursoTable {
         }
 
         block_on(async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = pool.acquire()?;
 
             // Read every counter's old value in a single request.
             let placeholders = (1..=keys.len())
@@ -630,6 +689,10 @@ impl KvTree for TursoTable {
                 }
             }
 
+            // The read phase is done with this connection; hand it back before
+            // the batch phase, which checks out its own.
+            pool.release(conn);
+
             // One transactional batch of compare-and-swap increments, sent as
             // a single pipeline request: the remote write lock is held for one
             // fast server-side execution instead of one round-trip per
@@ -654,7 +717,7 @@ impl KvTree for TursoTable {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let result = transactional_batch_with_retry(db, sql).await;
+            let result = transactional_batch_with_retry(pool, sql).await;
             if result.is_ok() {
                 for key in &keys {
                     self.watchers.wake(key);
@@ -682,12 +745,16 @@ impl KvTree for TursoTable {
 
     fn clear(&self) -> Result<()> {
         let name = self.name.clone();
-        let db = self.db.clone();
+        let pool = self.pool.clone();
 
         block_on(async move {
-            let conn = db.connect().map_err(|e| Error::LibSql(e.to_string()))?;
+            let conn = pool.acquire()?;
             let sql = format!("DELETE FROM {}", name);
-            exec_with_retry(&conn, &sql, Vec::new()).await
+            let result = exec_with_retry(&conn, &sql, Vec::new()).await;
+            if result.is_ok() {
+                pool.release(conn);
+            }
+            result
         })
     }
 }
