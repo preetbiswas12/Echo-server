@@ -93,7 +93,7 @@ const BUSY_RETRIES: usize = 6;
 
 /// How many times a compare-and-swap increment retries after losing the race
 /// to a concurrent writer.
-const CAS_ATTEMPTS: usize = 8;
+const CAS_ATTEMPTS: usize = 12;
 
 /// Runs an operation, retrying with exponential backoff while the remote
 /// database reports a busy/locked write lock.
@@ -536,7 +536,7 @@ impl KvTree for TursoTable {
             // one. No transaction is held open across the two round-trips, so
             // the remote write lock is never kept while waiting on the
             // network, and a lost race simply retries with a fresh read.
-            for _ in 0..CAS_ATTEMPTS {
+            for attempt in 0..CAS_ATTEMPTS {
                 let old: Option<Vec<u8>> = with_busy_retry(|| {
                     let conn = conn.clone();
                     let sql = sql_select.clone();
@@ -582,6 +582,11 @@ impl KvTree for TursoTable {
                 if changed > 0 {
                     return Ok(new);
                 }
+
+                // A concurrent writer incremented this counter between our
+                // read and our write. Back off briefly, then re-read and try
+                // again.
+                tokio::time::sleep(Duration::from_millis(50 + 50 * attempt as u64)).await;
             }
 
             Err(Error::LibSql(
