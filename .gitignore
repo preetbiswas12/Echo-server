@@ -75,6 +75,9 @@ signing.key
 logs/
 *.pid
 
+# AI session logs (diagnostics and transcripts, may contain secrets)
+.opencode/
+
 # Nix
 /result*
 
