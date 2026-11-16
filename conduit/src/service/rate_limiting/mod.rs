@@ -25,6 +25,18 @@ use crate::{
     services,
 };
 
+/// Saturating subtraction of a `Duration` from an `Instant`.
+///
+/// Fresh buckets below are initialised by subtracting the full burst window, which can span
+/// days for the per-day limits, from the arrival time. `Instant` is measured since the system
+/// booted, so on a freshly (re)booted machine that subtraction underflows and panics
+/// ("overflow when subtracting duration from instant"), taking down the request with an
+/// empty-bodied 500. Saturate instead; the only consequence is a reduced burst allowance until
+/// the system has been up for the burst window.
+fn saturating_sub(instant: Instant, duration: Duration) -> Instant {
+    instant.checked_sub(duration).unwrap_or(instant)
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Target {
     User(OwnedUserId),
@@ -206,17 +218,21 @@ impl Service {
                     return instant_to_err(&entry);
                 }
 
-                let min_instant = arrival
-                    - Duration::from_nanos(
+                let min_instant = saturating_sub(
+                    arrival,
+                    Duration::from_nanos(
                         config.timeframe.nano_gap() * config.burst_capacity.get(),
-                    );
+                    ),
+                );
                 entry.max(min_instant) + Duration::from_nanos(config.timeframe.nano_gap())
             }
             Entry::Vacant(_) => {
-                arrival
-                    - Duration::from_nanos(
+                saturating_sub(
+                    arrival,
+                    Duration::from_nanos(
                         config.timeframe.nano_gap() * (config.burst_capacity.get() - 1),
-                    )
+                    ),
+                )
             }
         };
 
@@ -238,19 +254,21 @@ impl Service {
                     return instant_to_err(&entry);
                 }
 
-                let min_instant = arrival
-                    - Duration::from_nanos(
+                let min_instant = saturating_sub(
+                    arrival,
+                    Duration::from_nanos(
                         config.timeframe.nano_gap() * config.burst_capacity.get(),
-                    );
+                    ),
+                );
                 *entry = entry.max(min_instant) + Duration::from_nanos(config.timeframe.nano_gap());
             }
             Entry::Vacant(vacant_entry) => {
-                vacant_entry.insert(Arc::new(Mutex::new(
-                    arrival
-                        - Duration::from_nanos(
-                            config.timeframe.nano_gap() * (config.burst_capacity.get() - 1),
-                        ),
-                )));
+                vacant_entry.insert(Arc::new(Mutex::new(saturating_sub(
+                    arrival,
+                    Duration::from_nanos(
+                        config.timeframe.nano_gap() * (config.burst_capacity.get() - 1),
+                    ),
+                ))));
             }
         }
 
@@ -419,14 +437,22 @@ impl Service {
                 let entry = Arc::clone(occupied_entry.get());
                 let mut entry = entry.write().await;
 
-                let min_instant =
-                    arrival - Duration::from_nanos(timeframe.nano_gap() * burst_capacity.get());
+                let min_instant = saturating_sub(
+                    arrival,
+                    Duration::from_nanos(timeframe.nano_gap() * burst_capacity.get()),
+                );
                 *entry = entry.max(min_instant) + Duration::from_nanos(timeframe.nano_gap());
             }
             Entry::Vacant(vacant_entry) => {
-                vacant_entry.insert(Arc::new(RwLock::new(
-                    arrival - Duration::from_nanos(burst_capacity.get() / timeframe.nano_gap()),
-                )));
+                vacant_entry.insert(Arc::new(RwLock::new(saturating_sub(
+                    arrival,
+                    // Previously this read `burst_capacity / nano_gap`, dividing a request
+                    // count by nanoseconds-per-request and effectively disabling the initial
+                    // burst allowance for this limiter.
+                    Duration::from_nanos(
+                        timeframe.nano_gap() * (burst_capacity.get() - 1),
+                    ),
+                ))));
             }
         }
     }
@@ -453,13 +479,13 @@ impl Service {
                         update_media_entry(size, target_limitation, &arrival, entry, false).await;
                 }
                 Entry::Vacant(vacant_entry) => {
-                    vacant_entry.insert(Arc::new(Mutex::new(
-                        arrival
-                            - Duration::from_nanos(
-                                target_limitation.burst_capacity.as_u64()
-                                    / target_limitation.timeframe.bytes_per_sec(),
-                            ),
-                    )));
+                    vacant_entry.insert(Arc::new(Mutex::new(saturating_sub(
+                        arrival,
+                        Duration::from_nanos(
+                            target_limitation.burst_capacity.as_u64()
+                                / target_limitation.timeframe.bytes_per_sec(),
+                        ),
+                    ))));
                 }
             }
 
@@ -544,10 +570,12 @@ fn get_proposed_entry(
     entry: &MutexGuard<'_, Instant>,
     and_check: bool,
 ) -> Result<Instant> {
-    let min_instant = *arrival
-        - Duration::from_secs(
+    let min_instant = saturating_sub(
+        *arrival,
+        Duration::from_secs(
             limitation.burst_capacity.as_u64() / limitation.timeframe.bytes_per_sec(),
-        );
+        ),
+    );
 
     let proposed_entry =
         entry.max(min_instant) + Duration::from_secs(size / limitation.timeframe.bytes_per_sec());
@@ -599,13 +627,13 @@ fn default_media_entry(
     target_limitation: MediaLimitation,
     arrival: Instant,
 ) -> Arc<Mutex<Instant>> {
-    Arc::new(Mutex::new(
-        arrival
-            - Duration::from_nanos(
-                target_limitation.burst_capacity.as_u64()
-                    / target_limitation.timeframe.bytes_per_sec(),
-            ),
-    ))
+    Arc::new(Mutex::new(saturating_sub(
+        arrival,
+        Duration::from_nanos(
+            target_limitation.burst_capacity.as_u64()
+                / target_limitation.timeframe.bytes_per_sec(),
+        ),
+    )))
 }
 
 fn instant_to_err(instant: &Instant) -> Result<()> {
