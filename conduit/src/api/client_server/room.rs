@@ -492,7 +492,14 @@ pub async fn create_room_route(
     // 8. Events implied by invite (and TODO: invite_3pid)
     drop(state_lock);
     for user_id in &body.invite {
-        let _ = invite_helper(&sender_user, user_id, &room_id, None, body.is_direct).await;
+        // A silently-failed invite would leave a room containing only its
+        // creator, which the client then renders as a DM with themselves.
+        // Fail the request loudly instead so the caller sees the error and
+        // the log names the cause.
+        if let Err(e) = invite_helper(&sender_user, user_id, &room_id, None, body.is_direct).await {
+            error!(?user_id, ?room_id, ?e, "Failed to create invite while creating room");
+            return Err(e);
+        }
     }
 
     // Homeserver specific stuff
