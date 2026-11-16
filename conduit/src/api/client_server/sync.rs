@@ -7,7 +7,7 @@ use crate::{
 
 use http::StatusCode;
 use ruma::{
-    DeviceId, EventId, JsOption, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
+    DeviceId, EventId, JsOption, OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
     api::{
         client::{
             filter::{FilterDefinition, LazyLoadOptions},
@@ -1367,6 +1367,20 @@ pub async fn sync_events_v5_route(
         .filter_map(|r| r.ok())
         .collect::<Vec<_>>();
 
+    // Invited rooms must also be surfaced through sliding sync, otherwise
+    // clients that only use this endpoint (e.g. Element X via the Rust SDK)
+    // never see invites, including DM invites between users on this server
+    let mut all_invited_rooms = BTreeMap::new();
+    for result in services()
+        .rooms
+        .state_cache
+        .rooms_invited(&sender_user)
+        .collect::<Vec<_>>()
+    {
+        let (room_id, invite_state_events) = result?;
+        all_invited_rooms.insert(room_id, invite_state_events);
+    }
+
     if body.extensions.to_device.enabled.unwrap_or(false) {
         services()
             .users
@@ -1553,20 +1567,29 @@ pub async fn sync_events_v5_route(
     let mut todo_rooms = BTreeMap::new(); // and required state
 
     for (list_id, list) in body.lists {
-        if list.filters.and_then(|f| f.is_invite).unwrap_or(false) {
-            continue;
-        }
+        let is_invite_filter = list.filters.and_then(|f| f.is_invite);
+
+        // Invited rooms are placed before joined rooms so that invites stay
+        // visible within the first ranges of lists that do not filter them
+        let universe: Vec<OwnedRoomId> = match is_invite_filter {
+            Some(true) => all_invited_rooms.keys().cloned().collect(),
+            Some(false) => all_joined_rooms.clone(),
+            None => all_invited_rooms
+                .keys()
+                .cloned()
+                .chain(all_joined_rooms.iter().cloned())
+                .collect(),
+        };
 
         let mut new_known_rooms = BTreeSet::new();
 
         for (mut start, mut end) in list.ranges {
             start = start.clamp(
                 uint!(0),
-                UInt::from(all_joined_rooms.len().saturating_sub(1) as u32),
+                UInt::from(universe.len().saturating_sub(1) as u32),
             );
-            end = end.clamp(start, UInt::from(all_joined_rooms.len() as u32));
-            let room_ids =
-                all_joined_rooms[(u64::from(start) as usize)..(u64::from(end) as usize)].to_vec();
+            end = end.clamp(start, UInt::from(universe.len() as u32));
+            let room_ids = universe[(u64::from(start) as usize)..(u64::from(end) as usize)].to_vec();
             new_known_rooms.extend(room_ids.iter().cloned());
             for room_id in &room_ids {
                 let todo_room =
@@ -1592,7 +1615,7 @@ pub async fn sync_events_v5_route(
         lists.insert(
             list_id.clone(),
             sync_events::v5::response::List {
-                count: UInt::from(all_joined_rooms.len() as u32),
+                count: UInt::from(universe.len() as u32),
             },
         );
 
@@ -1652,6 +1675,27 @@ pub async fn sync_events_v5_route(
 
     let mut rooms = BTreeMap::new();
     for (room_id, (required_state_request, timeline_limit, roomsince)) in &todo_rooms {
+        // Invited rooms may only receive stripped state, not the room's
+        // timeline or full state
+        if let Some(invite_state_events) = all_invited_rooms.get(room_id) {
+            let invite_count = services()
+                .rooms
+                .state_cache
+                .get_invite_count(room_id, &sender_user)?;
+
+            // Invited before last sync
+            if Some(globalsince) >= invite_count {
+                continue;
+            }
+
+            let room = rooms
+                .entry(room_id.clone())
+                .or_insert(sync_events::v5::response::Room::default());
+            room.invite_state = Some(invite_state_events.clone());
+            room.initial = Some(true);
+            continue;
+        }
+
         let roomsincecount = PduCount::Normal(*roomsince);
 
         let (timeline_pdus, limited) =
@@ -1815,7 +1859,9 @@ pub async fn sync_events_v5_route(
 
     if rooms
         .iter()
-        .all(|(_, r)| r.timeline.is_empty() && r.required_state.is_empty())
+        .all(|(_, r)| {
+            r.timeline.is_empty() && r.required_state.is_empty() && r.invite_state.is_none()
+        })
     {
         // Hang a few seconds so requests are not spammed
         // Stop hanging if new info arrives
