@@ -151,13 +151,14 @@ pub async fn sync_events_route(
         error!("Error waiting for sync: {}", e);
     }
 
-    match rx
-        .borrow()
-        .as_ref()
-        .expect("When sync channel changes it's always set to some")
-    {
-        Ok(response) => Ok(response.clone()),
-        Err(error) => Err(error.to_response()),
+    match rx.borrow().as_ref() {
+        Some(Ok(response)) => Ok(response.clone()),
+        Some(Err(error)) => Err(error.to_response()),
+        // The sender was dropped without ever producing a value (e.g. the sync
+        // task panicked). Panicking here would take every other concurrent
+        // sync for this user down with it, so fail the request gracefully.
+        None => Err(Error::bad_database("Sync task ended without a response")
+            .to_response()),
     }
 }
 
