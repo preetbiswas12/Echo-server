@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tracing::debug;
+use tracing::error;
 
 type TupleOfBytes = (Vec<u8>, Vec<u8>);
 
@@ -487,7 +487,10 @@ impl KvTree for TursoTable {
         match rows {
             Ok(rows) => Box::new(rows.into_iter()),
             Err(e) => {
-                debug!("turso iter error: {e}");
+                // The KvTree trait cannot propagate errors from an iterator,
+                // but silently pretending the table is empty turns a failing
+                // read into missing data; scream instead so the cause is seen.
+                error!("turso iter error: {e}");
                 Box::new(Vec::<TupleOfBytes>::new().into_iter())
             }
         }
@@ -543,7 +546,7 @@ impl KvTree for TursoTable {
         match rows {
             Ok(rows) => Box::new(rows.into_iter()),
             Err(e) => {
-                debug!("turso iter_from error: {e}");
+                error!("turso iter_from error: {e}");
                 Box::new(Vec::<TupleOfBytes>::new().into_iter())
             }
         }
@@ -623,6 +626,10 @@ impl KvTree for TursoTable {
                 tokio::time::sleep(Duration::from_millis(50 + 50 * attempt as u64)).await;
             }
 
+            // Losing the races means the connection itself is healthy (every
+            // attempt completed its round-trips), so return it to the pool
+            // instead of dropping it.
+            pool.release(conn);
             Err(Error::LibSql(
                 "increment lost the compare-and-swap race too many times".to_owned(),
             ))
