@@ -138,6 +138,17 @@ fn is_busy_error(e: &Error) -> bool {
     s.contains("SQLITE_BUSY") || s.contains("database is locked")
 }
 
+/// Matches connection-level failures of pooled remote connections, e.g. when
+/// Turso closes the underlying Hrana stream of a connection that sat idle in
+/// the pool (`stream not found`). These are worth retrying once on a
+/// brand-new connection instead of failing the statement.
+fn is_connection_error(e: &Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("stream not found")
+        || s.contains("problem with the connection")
+        || s.contains("error sending request")
+}
+
 /// How many times a database statement is retried while the remote database
 /// reports its write lock as busy.
 const BUSY_RETRIES: usize = 6;
@@ -206,6 +217,37 @@ async fn exec_changed_with_retry(
         }
     })
     .await
+}
+
+/// Runs a read that buffers every row into memory, retrying once on a fresh
+/// connection if the pooled connection turned out to be dead (e.g. Turso
+/// closed the Hrana stream of a connection that sat idle in the pool).
+///
+/// Without the retry, a stale connection turned a transient failure into an
+/// empty result, which callers misread as missing data (rooms suddenly
+/// "without" a create event, admin notices panicking, and so on).
+async fn buffered_select_with_retry<F, Fut>(pool: &ConnPool, mut run: F) -> Result<Vec<TupleOfBytes>>
+where
+    F: FnMut(libsql::Connection) -> Fut,
+    Fut: Future<Output = Result<Vec<TupleOfBytes>>>,
+{
+    let mut retried = false;
+    loop {
+        let conn = pool.acquire()?;
+        match run(conn.clone()).await {
+            Ok(rows) => {
+                pool.release(conn);
+                return Ok(rows);
+            }
+            Err(e) if !retried && is_connection_error(&e) => {
+                // Drop the dead connection instead of releasing it, then
+                // start the read over on a brand-new one.
+                retried = true;
+                error!("turso: pooled connection was stale ({e}); retrying on a fresh connection");
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Builds a SQLite blob literal (`X'ABCD..'`) for inlining raw bytes into
@@ -457,31 +499,34 @@ impl KvTree for TursoTable {
         let pool = self.pool.clone();
 
         let rows = block_on(async move {
-            let conn = pool.acquire()?;
-            let mut cursor = conn
-                .query(
-                    &format!("SELECT key, value FROM {} ORDER BY key ASC", name),
-                    libsql::params![],
-                )
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-            let mut rows = Vec::new();
-            while let Some(row) = cursor
-                .next()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?
-            {
-                let key: Vec<u8> = row
-                    .get(0)
-                    .map_err(|e| Error::LibSql(e.to_string()))?;
-                let value: Vec<u8> = row
-                    .get(1)
-                    .map_err(|e| Error::LibSql(e.to_string()))?;
-                rows.push((key, value));
-            }
-            let out = Ok::<Vec<TupleOfBytes>, Error>(rows);
-            pool.release(conn);
-            out
+            buffered_select_with_retry(&pool, |conn| {
+                let name = name.clone();
+                async move {
+                    let mut cursor = conn
+                        .query(
+                            &format!("SELECT key, value FROM {name} ORDER BY key ASC"),
+                            libsql::params![],
+                        )
+                        .await
+                        .map_err(|e| Error::LibSql(e.to_string()))?;
+                    let mut rows = Vec::new();
+                    while let Some(row) = cursor
+                        .next()
+                        .await
+                        .map_err(|e| Error::LibSql(e.to_string()))?
+                    {
+                        let key: Vec<u8> = row
+                            .get(0)
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+                        let value: Vec<u8> = row
+                            .get(1)
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+                        rows.push((key, value));
+                    }
+                    Ok(rows)
+                }
+            })
+            .await
         });
 
         match rows {
@@ -506,41 +551,42 @@ impl KvTree for TursoTable {
         let from = from.to_vec();
 
         let rows = block_on(async move {
-            let conn = pool.acquire()?;
-
             let sql = if backwards {
                 format!(
-                    "SELECT key, value FROM {} WHERE key <= ?1 ORDER BY key DESC",
-                    name
+                    "SELECT key, value FROM {name} WHERE key <= ?1 ORDER BY key DESC",
                 )
             } else {
                 format!(
-                    "SELECT key, value FROM {} WHERE key >= ?1 ORDER BY key ASC",
-                    name
+                    "SELECT key, value FROM {name} WHERE key >= ?1 ORDER BY key ASC",
                 )
             };
 
-            let mut cursor = conn
-                .query(&sql, libsql::params![from])
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?;
-            let mut rows = Vec::new();
-            while let Some(row) = cursor
-                .next()
-                .await
-                .map_err(|e| Error::LibSql(e.to_string()))?
-            {
-                let key: Vec<u8> = row
-                    .get(0)
-                    .map_err(|e| Error::LibSql(e.to_string()))?;
-                let value: Vec<u8> = row
-                    .get(1)
-                    .map_err(|e| Error::LibSql(e.to_string()))?;
-                rows.push((key, value));
-            }
-            let out = Ok::<Vec<TupleOfBytes>, Error>(rows);
-            pool.release(conn);
-            out
+            buffered_select_with_retry(&pool, |conn| {
+                let sql = sql.clone();
+                let from = from.clone();
+                async move {
+                    let mut cursor = conn
+                        .query(&sql, libsql::params![from])
+                        .await
+                        .map_err(|e| Error::LibSql(e.to_string()))?;
+                    let mut rows = Vec::new();
+                    while let Some(row) = cursor
+                        .next()
+                        .await
+                        .map_err(|e| Error::LibSql(e.to_string()))?
+                    {
+                        let key: Vec<u8> = row
+                            .get(0)
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+                        let value: Vec<u8> = row
+                            .get(1)
+                            .map_err(|e| Error::LibSql(e.to_string()))?;
+                        rows.push((key, value));
+                    }
+                    Ok(rows)
+                }
+            })
+            .await
         });
 
         match rows {

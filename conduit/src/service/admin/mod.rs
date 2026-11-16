@@ -39,6 +39,7 @@ use ruma::{
 };
 use serde_json::value::to_raw_value;
 use tokio::sync::{Mutex, RwLock, mpsc};
+use tracing::error;
 
 use crate::{
     Error, PduEvent, Result,
@@ -468,7 +469,7 @@ impl Service {
 
                         let state_lock = mutex_state.lock().await;
 
-                        services()
+                        if let Err(e) = services()
                             .rooms
                             .timeline
                             .build_and_append_pdu(
@@ -485,7 +486,13 @@ impl Service {
                                 &conduit_room,
                                 &state_lock,
                             )
-                            .await.unwrap();
+                            .await
+                        {
+                            // A corrupted admin room (e.g. one whose create
+                            // event cannot be resolved) must not take the
+                            // whole handler task down with an unwrap
+                            error!("Failed to append a message to the admin room: {e}");
+                        }
                     }
                 }
             }
@@ -493,15 +500,18 @@ impl Service {
     }
 
     pub fn process_message(&self, room_message: String) {
-        self.sender
-            .send(AdminRoomEvent::ProcessMessage(room_message))
-            .unwrap();
+        if let Err(e) = self.sender.send(AdminRoomEvent::ProcessMessage(room_message)) {
+            error!("Failed to queue an admin command: {e}");
+        }
     }
 
     pub fn send_message(&self, message_content: RoomMessageEventContent) {
-        self.sender
+        if let Err(e) = self
+            .sender
             .send(AdminRoomEvent::SendMessage(Box::new(message_content)))
-            .unwrap();
+        {
+            error!("Failed to queue an admin room message: {e}");
+        }
     }
 
     // Parse and process a message from the admin room
