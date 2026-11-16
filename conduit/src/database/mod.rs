@@ -1171,6 +1171,13 @@ impl KeyValueDatabase {
             );
         }
 
+        // Recreate the admin room if it is missing (e.g. it was removed from
+        // the database), so the server never ends up permanently without one.
+        if services().admin.get_admin_room()?.is_none() {
+            warn!("Admin room is missing, creating a new one");
+            services().admin.create_admin_room().await?;
+        }
+
         // This data is probably outdated
         db.presenceid_presence.clear()?;
 
