@@ -151,7 +151,13 @@ impl Error {
             _ => (Unknown, StatusCode::INTERNAL_SERVER_ERROR),
         };
 
-        info!("Returning an error: {}: {}", status_code, message);
+        if status_code.is_server_error() {
+            // 5xx responses are always worth seeing, even with the default
+            // `warn` log filter; other statuses stay at info level.
+            error!("Returning an error: {}: {}", status_code, message);
+        } else {
+            info!("Returning an error: {}: {}", status_code, message);
+        }
 
         RumaResponse(UiaaResponse::MatrixError(RumaError {
             body: ErrorBody::Standard(StandardErrorBody { kind, message }),

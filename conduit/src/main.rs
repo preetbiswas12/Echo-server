@@ -241,7 +241,10 @@ async fn run_server() -> io::Result<()> {
                     request.uri().path()
                 };
 
-                tracing::info_span!("http_request", %path)
+                // The span must be created at a level the default `warn`
+                // filter enables, otherwise failure logs lose the
+                // path/method context.
+                tracing::warn_span!("http_request", %path, method = %request.method())
             }),
         )
         .layer(axum::middleware::from_fn(unrecognized_method))
@@ -305,7 +308,12 @@ async fn spawn_task(
     }
     tokio::spawn(next.run(req))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|error| {
+            // JoinError carries the panic location; log it so the handler that
+            // crashed is visible in the logs next to the tower-http 500 line.
+            error!(?error, "Request task panicked");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn unrecognized_method(
